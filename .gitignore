@@ -1,0 +1,9 @@
+/target
+
+# Generated datasets and artifacts — never commit these
+/data/
+*.fifopack
+*.fifopack.idx.json
+*.bench.json
+router-log.jsonl
+rollup.json

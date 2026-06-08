@@ -1,0 +1,329 @@
+//! The packed compute table — Decision 5 realized directly as a transparent,
+//! fixed-width, struct-packed binary buffer (no Lance encoder in the loop).
+//!
+//! Why this shape:
+//! - **Struct-packed** 32-byte FIFO tuple `(side⊕qty, price_ticks, day, ts)` —
+//!   all fields the kernel needs in one contiguous, 8-byte-aligned record.
+//! - **Transparent**: every value is extractable from location+length alone, so
+//!   the `records` buffer mmaps and DMAs to the GPU with **no CPU decompress**.
+//!   No LZ4/Snappy/zstd on this hot path.
+//! - **Clustered** by `(client, symbol, ts)` (the generator already emits that
+//!   order), so partitions are contiguous and a `(client,symbol)` lookup is a
+//!   binary search, not a scan.
+//!
+//! Layout (one file): `[Header][part_client][part_symbol][part_offset][records]`
+//! with `records` aligned to 4 KiB so an mmap'd page maps cleanly to a GPU
+//! transfer unit (the ~8 MiB page ≈ one CUDA stream unit, Decision 5).
+
+use crate::generate::TICK;
+use anyhow::{ensure, Result};
+use bytemuck::{Pod, Zeroable};
+use memmap2::Mmap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::mem::size_of;
+use std::path::Path;
+
+/// One trade, packed for the FIFO kernel. `#[repr(C)]`, 32 bytes, no padding.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct PackedTrade {
+    /// `+qty` for a buy, `-qty` for a sell (side ⊕ qty).
+    pub signed_qty: i64,
+    /// Price in integer ticks (price / TICK), exact and fixed-width.
+    pub price_ticks: i64,
+    /// Calendar day-index (days since epoch) — for intraday/short/long bucketing.
+    pub day: i32,
+    pub _pad: i32,
+    /// Raw timestamp (µs) — kept for audit / tie-breaks; ordering is implicit.
+    pub ts: i64,
+}
+
+impl PackedTrade {
+    #[inline]
+    pub fn is_buy(&self) -> bool {
+        self.signed_qty > 0
+    }
+    #[inline]
+    pub fn qty(&self) -> i64 {
+        self.signed_qty.abs()
+    }
+    #[inline]
+    pub fn price(&self) -> f64 {
+        self.price_ticks as f64 * TICK
+    }
+}
+
+#[inline]
+pub fn price_to_ticks(price: f64) -> i64 {
+    (price / TICK).round() as i64
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+impl PackedTrade {
+    /// Convert a wide tradebook row into the packed FIFO tuple.
+    pub fn from_trade(t: &crate::schema::Trade) -> Self {
+        PackedTrade {
+            signed_qty: t.side as i64 * t.quantity as i64,
+            price_ticks: price_to_ticks(t.price),
+            day: (t.ts_micros / MICROS_PER_DAY) as i32,
+            _pad: 0,
+            ts: t.ts_micros,
+        }
+    }
+}
+
+const MAGIC: [u8; 8] = *b"FIFOPK01";
+const RECORD_ALIGN: u64 = 4096;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Header {
+    magic: [u8; 8],
+    version: u32,
+    _pad: u32,
+    n_rows: u64,
+    n_parts: u64,
+    tick: f64,
+    off_part_client: u64,
+    off_part_symbol: u64,
+    off_part_offset: u64,
+    off_records: u64,
+    file_len: u64,
+}
+
+#[inline]
+fn align_up(x: u64, a: u64) -> u64 {
+    (x + a - 1) / a * a
+}
+
+/// In-memory builder; the packer streams partitions into it (or writes directly).
+#[derive(Default)]
+pub struct PackedBuilder {
+    pub records: Vec<PackedTrade>,
+    pub part_client: Vec<u64>,
+    pub part_symbol: Vec<u32>,
+    /// Prefix offsets, length `n_parts + 1`; last entry == n_rows.
+    pub part_offset: Vec<u64>,
+}
+
+impl PackedBuilder {
+    pub fn new() -> Self {
+        let mut b = PackedBuilder::default();
+        b.part_offset.push(0);
+        b
+    }
+
+    /// Append a whole partition's already-ts-sorted records.
+    pub fn push_partition(&mut self, client: u64, symbol: u32, recs: &[PackedTrade]) {
+        if recs.is_empty() {
+            return;
+        }
+        self.part_client.push(client);
+        self.part_symbol.push(symbol);
+        self.records.extend_from_slice(recs);
+        self.part_offset.push(self.records.len() as u64);
+    }
+
+    pub fn n_parts(&self) -> usize {
+        self.part_client.len()
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let n_rows = self.records.len() as u64;
+        let n_parts = self.part_client.len() as u64;
+        debug_assert_eq!(self.part_offset.len() as u64, n_parts + 1);
+
+        let h_size = size_of::<Header>() as u64;
+        let off_part_client = align_up(h_size, 8);
+        let off_part_symbol = align_up(off_part_client + n_parts * 8, 8);
+        let off_part_offset = align_up(off_part_symbol + n_parts * 4, 8);
+        let off_records = align_up(off_part_offset + (n_parts + 1) * 8, RECORD_ALIGN);
+        let file_len = off_records + n_rows * size_of::<PackedTrade>() as u64;
+
+        let header = Header {
+            magic: MAGIC,
+            version: 1,
+            _pad: 0,
+            n_rows,
+            n_parts,
+            tick: TICK,
+            off_part_client,
+            off_part_symbol,
+            off_part_offset,
+            off_records,
+            file_len,
+        };
+
+        let mut w = BufWriter::new(File::create(path)?);
+        let mut pos = 0u64;
+        let pad_to = |w: &mut BufWriter<File>, pos: &mut u64, target: u64| -> Result<()> {
+            while *pos < target {
+                w.write_all(&[0u8])?;
+                *pos += 1;
+            }
+            Ok(())
+        };
+
+        w.write_all(bytemuck::bytes_of(&header))?;
+        pos += h_size;
+        pad_to(&mut w, &mut pos, off_part_client)?;
+        w.write_all(bytemuck::cast_slice(&self.part_client))?;
+        pos += n_parts * 8;
+        pad_to(&mut w, &mut pos, off_part_symbol)?;
+        w.write_all(bytemuck::cast_slice(&self.part_symbol))?;
+        pos += n_parts * 4;
+        pad_to(&mut w, &mut pos, off_part_offset)?;
+        w.write_all(bytemuck::cast_slice(&self.part_offset))?;
+        pos += (n_parts + 1) * 8;
+        pad_to(&mut w, &mut pos, off_records)?;
+        w.write_all(bytemuck::cast_slice(&self.records))?;
+        w.flush()?;
+        Ok(())
+    }
+}
+
+/// A memory-mapped, zero-copy view of a packed compute table. The `records`
+/// slice IS the on-disk buffer — no decode, no copy. This is the buffer the GPU
+/// uploader hands straight to `cudaMemcpy`.
+pub struct PackedTable {
+    mmap: Mmap,
+    header: Header,
+}
+
+impl PackedTable {
+    pub fn open(path: &Path) -> Result<Self> {
+        let f = File::open(path)?;
+        // SAFETY: file is read-only for the lifetime of the mmap.
+        let mmap = unsafe { Mmap::map(&f)? };
+        ensure!(
+            mmap.len() >= size_of::<Header>(),
+            "file too small to be a packed table"
+        );
+        let header: Header = *bytemuck::from_bytes(&mmap[..size_of::<Header>()]);
+        ensure!(header.magic == MAGIC, "bad magic — not a FIFOPK file");
+        ensure!(
+            mmap.len() as u64 >= header.file_len,
+            "truncated packed table"
+        );
+        Ok(PackedTable { mmap, header })
+    }
+
+    #[inline]
+    fn section<T: Pod>(&self, off: u64, count: u64) -> &[T] {
+        let start = off as usize;
+        let bytes = &self.mmap[start..start + count as usize * size_of::<T>()];
+        bytemuck::cast_slice(bytes)
+    }
+
+    pub fn n_rows(&self) -> u64 {
+        self.header.n_rows
+    }
+    pub fn n_parts(&self) -> u64 {
+        self.header.n_parts
+    }
+    pub fn records(&self) -> &[PackedTrade] {
+        self.section(self.header.off_records, self.header.n_rows)
+    }
+    pub fn part_client(&self) -> &[u64] {
+        self.section(self.header.off_part_client, self.header.n_parts)
+    }
+    pub fn part_symbol(&self) -> &[u32] {
+        self.section(self.header.off_part_symbol, self.header.n_parts)
+    }
+    pub fn part_offset(&self) -> &[u64] {
+        self.section(self.header.off_part_offset, self.header.n_parts + 1)
+    }
+
+    /// Records of partition `p`.
+    pub fn partition(&self, p: usize) -> &[PackedTrade] {
+        let off = self.part_offset();
+        &self.records()[off[p] as usize..off[p + 1] as usize]
+    }
+
+    /// Partition index for an exact `(client, symbol)`, if present.
+    pub fn find_partition(&self, client: u64, symbol: u32) -> Option<usize> {
+        let pc = self.part_client();
+        let ps = self.part_symbol();
+        // partitions are sorted by (client, symbol)
+        let mut lo = 0usize;
+        let mut hi = pc.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let key = (pc[mid], ps[mid]);
+            match key.cmp(&(client, symbol)) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    /// Half-open range of partition indices belonging to `client`.
+    pub fn partitions_for_client(&self, client: u64) -> std::ops::Range<usize> {
+        let pc = self.part_client();
+        let lo = pc.partition_point(|&c| c < client);
+        let hi = pc.partition_point(|&c| c <= client);
+        lo..hi
+    }
+
+    /// Sub-slice of a partition restricted to `day ∈ [lo, hi]`. Records are
+    /// ts-sorted, hence day-sorted, so this is two binary searches.
+    pub fn day_range<'a>(&self, recs: &'a [PackedTrade], lo: i32, hi: i32) -> &'a [PackedTrade] {
+        let s = recs.partition_point(|r| r.day < lo);
+        let e = recs.partition_point(|r| r.day <= hi);
+        &recs[s..e]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(sq: i64, px: i64, day: i32) -> PackedTrade {
+        PackedTrade {
+            signed_qty: sq,
+            price_ticks: px,
+            day,
+            _pad: 0,
+            ts: day as i64 * 86_400_000_000,
+        }
+    }
+
+    #[test]
+    fn record_is_32_bytes() {
+        assert_eq!(size_of::<PackedTrade>(), 32);
+    }
+
+    #[test]
+    fn write_read_roundtrip_and_lookup() {
+        let mut b = PackedBuilder::new();
+        b.push_partition(1, 10, &[rec(100, 2000, 1), rec(-100, 2100, 2)]);
+        b.push_partition(1, 20, &[rec(50, 500, 1)]);
+        b.push_partition(2, 10, &[rec(10, 100, 5), rec(10, 110, 400), rec(-20, 120, 800)]);
+
+        let path = std::env::temp_dir().join("fifo_pack_test.fifopack");
+        b.write(&path).unwrap();
+        let t = PackedTable::open(&path).unwrap();
+
+        assert_eq!(t.n_parts(), 3);
+        assert_eq!(t.n_rows(), 6);
+        // zero-copy bytes equal what we wrote
+        assert_eq!(t.partition(0), &[rec(100, 2000, 1), rec(-100, 2100, 2)]);
+
+        let p = t.find_partition(2, 10).unwrap();
+        assert_eq!(t.partition(p).len(), 3);
+        assert!(t.find_partition(9, 9).is_none());
+
+        assert_eq!(t.partitions_for_client(1), 0..2);
+        assert_eq!(t.partitions_for_client(2), 2..3);
+
+        // day-range prune within the (2,10) partition
+        let recs = t.partition(p);
+        assert_eq!(t.day_range(recs, 0, 10).len(), 1); // only day 5
+        assert_eq!(t.day_range(recs, 400, 800).len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+}
