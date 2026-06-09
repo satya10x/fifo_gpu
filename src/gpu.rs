@@ -34,7 +34,7 @@ use crate::fifo::{BucketPnl, PartitionPnl};
 use crate::packed::PackedTable;
 use anyhow::{Context, Result};
 use cudarc::driver::{
-    result, sys, CudaDevice, CudaSlice, DevicePtr, DeviceSlice, LaunchAsync, LaunchConfig,
+    result, sys, CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
@@ -493,8 +493,6 @@ impl GpuEngine {
         let mut d_price: Vec<CudaSlice<i64>> = Vec::new();
         let mut d_day: Vec<CudaSlice<i32>> = Vec::new();
         let mut d_lots: Vec<CudaSlice<u8>> = Vec::new();
-        let mut d_real: Vec<CudaSlice<f64>> = Vec::new();
-        let mut d_qty: Vec<CudaSlice<i64>> = Vec::new();
         for _ in 0..2 {
             unsafe {
                 d_recs.push(self.dev.alloc::<u8>(max_rows * rec_sz)?);
@@ -504,29 +502,26 @@ impl GpuEngine {
                 d_price.push(self.dev.alloc::<i64>(max_rows)?);
                 d_day.push(self.dev.alloc::<i32>(max_rows)?);
                 d_lots.push(self.dev.alloc::<u8>(max_rows * 24)?);
-                d_real.push(self.dev.alloc::<f64>(max_parts * 3)?);
-                d_qty.push(self.dev.alloc::<i64>(max_parts * 3)?);
             }
         }
+        // ONE global output buffer (zeroed once). Each chunk's kernels write their
+        // partition slice via a slice_mut view, and we do a SINGLE dtoh at the end
+        // — no per-chunk device→host sync, which is what lets the streams overlap.
+        let mut d_real = self.dev.alloc_zeros::<f64>(n_parts * 3)?;
+        let mut d_qty = self.dev.alloc_zeros::<i64>(n_parts * 3)?;
 
-        let mut out_real = vec![[0f64; 3]; n_parts];
-        let mut out_qty = vec![[0i64; 3]; n_parts];
-        let mut pending: [Option<(usize, usize)>; 2] = [None, None]; // (chunk p0, n_parts)
-
+        let mut used = [false; 2];
         let t0 = std::time::Instant::now();
         for (i, &(cp0, cp1)) in chunks.iter().enumerate() {
             let slot = i % 2;
-
-            // harvest the chunk currently occupying this slot before overwriting
-            if let Some((pp0, pparts)) = pending[slot].take() {
+            // free this slot's input/staging buffers from the chunk 2 iters ago
+            if used[slot] {
                 unsafe { result::stream::synchronize(streams[slot].stream)? };
-                self.harvest(slot, pp0, pparts, &d_real, &d_qty, &mut out_real, &mut out_qty)?;
             }
 
             let r0 = offsets[cp0] as usize;
             let r1 = offsets[cp1] as usize;
             let parts = cp1 - cp0;
-            // chunk-local offsets + big-partition indices
             let off_local: Vec<u64> = (cp0..=cp1).map(|p| offsets[p] - offsets[cp0]).collect();
             let big_local: Vec<u32> = (0..parts as u32)
                 .filter(|&k| off_local[k as usize + 1] - off_local[k as usize] >= big_threshold)
@@ -535,12 +530,10 @@ impl GpuEngine {
 
             let st = streams[slot].stream;
             unsafe {
-                // async H2D: records from the pinned host buffer (this overlaps);
-                // the tiny offset/index arrays are pageable (effectively sync).
+                // async H2D: records from pinned staging (overlaps the prior
+                // chunk's kernel); tiny offset/index arrays are pageable.
                 let rec_bytes: &[u8] = bytemuck::cast_slice(&records[r0..r1]);
                 if pinned {
-                    // copy chunk into pinned staging, then async H2D from it (the
-                    // slot is free to overwrite — we synchronize before reuse)
                     std::ptr::copy_nonoverlapping(
                         rec_bytes.as_ptr(),
                         staging[slot] as *mut u8,
@@ -556,11 +549,12 @@ impl GpuEngine {
                 if nbig > 0 {
                     result::memcpy_htod_async(*d_bigp[slot].device_ptr(), &big_local, st)?;
                 }
-                // zero this chunk's outputs (big kernel atomic-adds onto them)
-                result::memset_d8_async(*d_real[slot].device_ptr(), 0, parts * 3 * 8, st)?;
-                result::memset_d8_async(*d_qty[slot].device_ptr(), 0, parts * 3 * 8, st)?;
             }
 
+            // kernels write into this chunk's slice of the global output (the
+            // small kernel overwrites small parts; the big kernel atomic-adds onto
+            // the once-zeroed slice). Each slice_mut borrow ends when launch
+            // returns, so chunks on different streams don't alias in Rust's view.
             let cfg_small = LaunchConfig::for_num_elems(parts as u32);
             let small = self.dev.get_func("fifo", "fifo_kernel").unwrap();
             unsafe {
@@ -573,8 +567,8 @@ impl GpuEngine {
                         parts as i32,
                         big_threshold,
                         &d_lots[slot],
-                        &mut d_real[slot],
-                        &mut d_qty[slot],
+                        &mut d_real.slice_mut(cp0 * 3..cp1 * 3),
+                        &mut d_qty.slice_mut(cp0 * 3..cp1 * 3),
                     ),
                 )?;
             }
@@ -597,22 +591,21 @@ impl GpuEngine {
                             &mut d_cum[slot],
                             &mut d_price[slot],
                             &mut d_day[slot],
-                            &mut d_real[slot],
-                            &mut d_qty[slot],
+                            &mut d_real.slice_mut(cp0 * 3..cp1 * 3),
+                            &mut d_qty.slice_mut(cp0 * 3..cp1 * 3),
                         ),
                     )?;
                 }
             }
-            pending[slot] = Some((cp0, parts));
+            used[slot] = true;
         }
 
-        // drain the last (≤2) in-flight chunks
-        for slot in 0..2 {
-            if let Some((pp0, pparts)) = pending[slot].take() {
-                unsafe { result::stream::synchronize(streams[slot].stream)? };
-                self.harvest(slot, pp0, pparts, &d_real, &d_qty, &mut out_real, &mut out_qty)?;
-            }
+        // one sync + one dtoh of the whole output
+        for s in &streams {
+            unsafe { result::stream::synchronize(s.stream)? };
         }
+        let rv = self.dev.dtoh_sync_copy(&d_real)?;
+        let qv = self.dev.dtoh_sync_copy(&d_qty)?;
         let total_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         for &s in staging.iter() {
@@ -622,34 +615,10 @@ impl GpuEngine {
                 }
             }
         }
-        Ok((sum_pnl(&out_real, &out_qty), total_ms, pinned))
-    }
 
-    /// Copy one chunk's per-partition results (device → host) into the global
-    /// accumulators at the chunk's base partition index.
-    #[allow(clippy::too_many_arguments)]
-    fn harvest(
-        &self,
-        slot: usize,
-        cp0: usize,
-        parts: usize,
-        d_real: &[CudaSlice<f64>],
-        d_qty: &[CudaSlice<i64>],
-        out_real: &mut [[f64; 3]],
-        out_qty: &mut [[i64; 3]],
-    ) -> Result<()> {
-        // dtoh_sync_copy_into requires src.len() == dst.len(), so size the host
-        // buffers to the (max_parts-sized) device slices and read only this
-        // chunk's first `parts` entries.
-        let mut hr = vec![0f64; d_real[slot].len()];
-        let mut hq = vec![0i64; d_qty[slot].len()];
-        self.dev.dtoh_sync_copy_into(&d_real[slot], &mut hr)?;
-        self.dev.dtoh_sync_copy_into(&d_qty[slot], &mut hq)?;
-        for k in 0..parts {
-            out_real[cp0 + k] = [hr[k * 3], hr[k * 3 + 1], hr[k * 3 + 2]];
-            out_qty[cp0 + k] = [hq[k * 3], hq[k * 3 + 1], hq[k * 3 + 2]];
-        }
-        Ok(())
+        let out_real: Vec<[f64; 3]> = rv.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let out_qty: Vec<[i64; 3]> = qv.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        Ok((sum_pnl(&out_real, &out_qty), total_ms, pinned))
     }
 }
 
