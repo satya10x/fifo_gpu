@@ -38,6 +38,9 @@ pub struct QueryResult {
     pub pnl: PartitionPnl,
     pub rows_touched: u64,
     pub partition_fanout: u64,
+    /// Rows in the single largest partition touched — the GPU serialization
+    /// (whale-tail) signal for the router.
+    pub max_partition_rows: u64,
     pub checkpoints_loaded: u64,
 }
 
@@ -82,6 +85,7 @@ pub fn run_cpu<S: FragmentSink>(
         let part_pnl = match q.span {
             Span::Full => {
                 out.rows_touched += recs.len() as u64;
+                out.max_partition_rows = out.max_partition_rows.max(recs.len() as u64);
                 let mut carry = VecDeque::new();
                 fold_core(client, symbol, &mut carry, recs, sink, None)
             }
@@ -96,6 +100,7 @@ pub fn run_cpu<S: FragmentSink>(
                 // Replay only (cutoff, hi]; count only sells in [lo, hi].
                 let replay = table.day_range(recs, cutoff.saturating_add(1), hi);
                 out.rows_touched += replay.len() as u64;
+                out.max_partition_rows = out.max_partition_rows.max(replay.len() as u64);
                 fold_core(client, symbol, &mut carry, replay, sink, Some((lo, hi)))
             }
         };

@@ -7,10 +7,16 @@
 //! ```text
 //! cpu_ns = rows·cpu_per_row + checkpoints·ckpt_load
 //! gpu_ns = gpu_fixed + rows·(h2d_per_row + gpu_per_row)
-//!          + fanout·launch_overhead + checkpoints·ckpt_load
+//!          + fanout·launch_overhead + max_part·gpu_serial_per_row
+//!          + checkpoints·ckpt_load
 //! route  = argmin(cpu_ns, gpu_ns)
 //! ```
-//! `fanout` is the skew term (10M trades in one whale ≠ 10M across 2M tinies);
+//! Two skew terms, because skew bites the GPU two opposite ways:
+//! - `fanout` — many tiny partitions ⇒ launch/coordination overhead (favours CPU);
+//! - `max_part` — the *largest* partition's residual within-block serialization
+//!   (the whale tail). With the within-partition kernel this coefficient is small
+//!   (≈ `gpu_per_row / BIG_BLOCK`), but it's the term that stopped the router from
+//!   sending an all-in-one-partition whale to a single serial GPU thread.
 //! `checkpoints` can dominate cross-client narrow ranges — another reason those
 //! go to the rollup, not live compute.
 
@@ -31,6 +37,8 @@ pub struct RouterCoeffs {
     pub gpu_per_row_ns: f64,
     pub h2d_per_row_ns: f64,
     pub launch_per_partition_ns: f64,
+    /// Residual serial cost per row of the *largest* partition (whale tail).
+    pub gpu_serial_per_row_ns: f64,
     pub ckpt_load_ns: f64,
     pub gpu_fixed_ns: f64,
 }
@@ -43,6 +51,9 @@ impl Default for RouterCoeffs {
             gpu_per_row_ns: 0.2,
             h2d_per_row_ns: 1.6, // ~20 GB/s effective / 32 B record ≈ 1.6 ns/row
             launch_per_partition_ns: 2_000.0,
+            // within-partition kernel splits the biggest partition over BIG_BLOCK
+            // threads, so the residual serial term is ~gpu_per_row / 256.
+            gpu_serial_per_row_ns: 0.2 / 256.0,
             ckpt_load_ns: 500.0,
             gpu_fixed_ns: 50_000.0, // kernel launch + setup floor
         }
@@ -61,16 +72,17 @@ impl RouterCoeffs {
         rows as f64 * self.cpu_per_row_ns + checkpoints as f64 * self.ckpt_load_ns
     }
 
-    pub fn predict_gpu(&self, rows: u64, fanout: u64, checkpoints: u64) -> f64 {
+    pub fn predict_gpu(&self, rows: u64, fanout: u64, max_part: u64, checkpoints: u64) -> f64 {
         self.gpu_fixed_ns
             + rows as f64 * (self.h2d_per_row_ns + self.gpu_per_row_ns)
             + fanout as f64 * self.launch_per_partition_ns
+            + max_part as f64 * self.gpu_serial_per_row_ns
             + checkpoints as f64 * self.ckpt_load_ns
     }
 
-    pub fn route(&self, rows: u64, fanout: u64, checkpoints: u64) -> Prediction {
+    pub fn route(&self, rows: u64, fanout: u64, max_part: u64, checkpoints: u64) -> Prediction {
         let cpu_ns = self.predict_cpu(rows, checkpoints);
-        let gpu_ns = self.predict_gpu(rows, fanout, checkpoints);
+        let gpu_ns = self.predict_gpu(rows, fanout, max_part, checkpoints);
         Prediction {
             engine: if gpu_ns < cpu_ns { Engine::Gpu } else { Engine::Cpu },
             cpu_ns,
@@ -84,6 +96,7 @@ impl RouterCoeffs {
 pub struct Observation {
     pub rows: u64,
     pub fanout: u64,
+    pub max_part: u64,
     pub checkpoints: u64,
     pub cpu_ns: f64,
     pub gpu_ns: Option<f64>,
@@ -133,6 +146,7 @@ pub fn fit(samples: &[Observation]) -> RouterCoeffs {
 pub struct PredVsActual {
     pub rows: u64,
     pub fanout: u64,
+    pub max_part: u64,
     pub checkpoints: u64,
     pub chosen: Engine,
     pub predicted_ns: f64,
@@ -156,9 +170,10 @@ mod tests {
     fn tiny_query_routes_cpu_huge_routes_gpu() {
         let c = RouterCoeffs::default();
         // tiny per-client lookup: 50 rows, 1 partition, 1 checkpoint
-        assert_eq!(c.route(50, 1, 1).engine, Engine::Cpu);
-        // all-history whale recompute: 50M rows, few partitions, no checkpoints
-        assert_eq!(c.route(50_000_000, 4, 0).engine, Engine::Gpu);
+        assert_eq!(c.route(50, 1, 50, 1).engine, Engine::Cpu);
+        // all-history whale recompute: 50M rows over a few partitions, biggest
+        // ~15M rows, no checkpoints — GPU wins now that big partitions parallelize.
+        assert_eq!(c.route(50_000_000, 4, 15_000_000, 0).engine, Engine::Gpu);
     }
 
     #[test]
@@ -167,6 +182,7 @@ mod tests {
             .map(|i| Observation {
                 rows: i * 1000,
                 fanout: 1,
+                max_part: i * 1000,
                 checkpoints: 0,
                 cpu_ns: (i * 1000) as f64 * 4.0, // true slope 4 ns/row
                 gpu_ns: None,

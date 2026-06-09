@@ -53,6 +53,7 @@ struct BenchRow {
     span: String,
     rows_touched: u64,
     partition_fanout: u64,
+    max_partition_rows: u64,
     checkpoints: u64,
     cpu_ms: f64,
     baseline_ms: f64,
@@ -130,24 +131,30 @@ pub fn run_bench(
     let mut observations: Vec<Observation> = Vec::new();
 
     println!(
-        "{:<26} {:>10} {:>8} {:>10} {:>11} {:>9} {:>7}",
-        "query", "rows", "parts", "cpu(ms)", "base(ms)", "speedup", "route"
+        "{:<26} {:>10} {:>8} {:>10} {:>10} {:>11} {:>9} {:>7}",
+        "query", "rows", "parts", "maxpart", "cpu(ms)", "base(ms)", "speedup", "route"
     );
-    println!("{}", "─".repeat(92));
+    println!("{}", "─".repeat(103));
 
     for (name, q) in &queries {
         let (cpu_res, cpu_ms) = timed(|| run_cpu(&table, Some(&store), q, &mut NoopSink).unwrap());
         let ((base_pnl, _base_rows), base_ms) = timed(|| baseline_query(tradebook_dir, q).unwrap());
         let matches = cpu_res.pnl == base_pnl;
 
-        let pred = coeffs.route(cpu_res.rows_touched, cpu_res.partition_fanout, cpu_res.checkpoints_loaded);
+        let pred = coeffs.route(
+            cpu_res.rows_touched,
+            cpu_res.partition_fanout,
+            cpu_res.max_partition_rows,
+            cpu_res.checkpoints_loaded,
+        );
         let speedup = if cpu_ms > 0.0 { base_ms / cpu_ms } else { 0.0 };
 
         println!(
-            "{:<26} {:>10} {:>8} {:>10.2} {:>11.2} {:>8.1}x {:>7}",
+            "{:<26} {:>10} {:>8} {:>10} {:>10.2} {:>11.2} {:>8.1}x {:>7}",
             name,
             cpu_res.rows_touched,
             cpu_res.partition_fanout,
+            cpu_res.max_partition_rows,
             cpu_ms,
             base_ms,
             speedup,
@@ -162,6 +169,7 @@ pub fn run_bench(
         observations.push(Observation {
             rows: cpu_res.rows_touched,
             fanout: cpu_res.partition_fanout,
+            max_part: cpu_res.max_partition_rows,
             checkpoints: cpu_res.checkpoints_loaded,
             cpu_ns: cpu_ms * 1e6,
             gpu_ns: None,
@@ -171,6 +179,7 @@ pub fn run_bench(
             span: span_label(&q.span),
             rows_touched: cpu_res.rows_touched,
             partition_fanout: cpu_res.partition_fanout,
+            max_partition_rows: cpu_res.max_partition_rows,
             checkpoints: cpu_res.checkpoints_loaded,
             cpu_ms,
             baseline_ms: base_ms,
@@ -190,14 +199,16 @@ pub fn run_bench(
     println!("  gpu_per_row_ns      = {:.3}", fitted.gpu_per_row_ns);
     println!("  h2d_per_row_ns      = {:.3}", fitted.h2d_per_row_ns);
     println!("  launch_per_part_ns  = {:.1}", fitted.launch_per_partition_ns);
+    println!("  gpu_serial_per_row  = {:.5}", fitted.gpu_serial_per_row_ns);
     for (obs, row) in observations.iter().zip(rows_out.iter()) {
-        let pred = fitted.route(obs.rows, obs.fanout, obs.checkpoints);
+        let pred = fitted.route(obs.rows, obs.fanout, obs.max_part, obs.checkpoints);
         let actual_ns = row.cpu_ms * 1e6;
         let _ = router::log_pred_vs_actual(
             router_log,
             &router::PredVsActual {
                 rows: obs.rows,
                 fanout: obs.fanout,
+                max_part: obs.max_part,
                 checkpoints: obs.checkpoints,
                 chosen: pred.engine,
                 predicted_ns: pred.cpu_ns.min(pred.gpu_ns),
