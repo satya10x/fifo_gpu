@@ -3,14 +3,14 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use fifo_lance::checkpoint::CheckpointStore;
-use fifo_lance::config::GenConfig;
-use fifo_lance::fifo::{fold_table, PartitionPnl};
-use fifo_lance::manifest::Manifest;
-use fifo_lance::packed::PackedTable;
-use fifo_lance::query::{run_cpu, ClientSel, Query, Span};
-use fifo_lance::rollup::Rollup;
-use fifo_lance::{calendar, correction};
+use fifo_gpu::checkpoint::CheckpointStore;
+use fifo_gpu::config::GenConfig;
+use fifo_gpu::fifo::{fold_table, PartitionPnl};
+use fifo_gpu::manifest::Manifest;
+use fifo_gpu::packed::PackedTable;
+use fifo_gpu::query::{run_cpu, ClientSel, Query, Span};
+use fifo_gpu::rollup::Rollup;
+use fifo_gpu::{calendar, correction};
 use std::path::PathBuf;
 
 fn print_pnl(p: &PartitionPnl) {
@@ -31,7 +31,7 @@ fn print_pnl(p: &PartitionPnl) {
     );
     println!(
         "  TOTAL    : {:>16.2}",
-        (p.total_ticks() as f64) * fifo_lance::generate::TICK
+        (p.total_ticks() as f64) * fifo_gpu::generate::TICK
     );
 }
 
@@ -185,7 +185,7 @@ struct PackArgs {
     #[arg(long, default_value = "data/compute.fifopack")]
     out: PathBuf,
     /// Records per page (8 MiB ≈ 262144 × 32 B).
-    #[arg(long, default_value_t = fifo_lance::index::PAGE_RECORDS)]
+    #[arg(long, default_value_t = fifo_gpu::index::PAGE_RECORDS)]
     page_records: usize,
 }
 
@@ -209,7 +209,7 @@ fn main() -> Result<()> {
                 cfg.clients, cfg.mean_per_day, cfg.days
             );
             let t0 = std::time::Instant::now();
-            let manifest = fifo_lance::generate::generate(&cfg)?;
+            let manifest = fifo_gpu::generate::generate(&cfg)?;
             let dt = t0.elapsed();
             println!(
                 "Wrote {} trades to {} in {:.2}s ({:.1}M trades/s)",
@@ -219,12 +219,12 @@ fn main() -> Result<()> {
                 manifest.realized_total as f64 / dt.as_secs_f64() / 1e6
             );
             println!("Range: {} … {}", manifest.start_date, manifest.end_date_inclusive);
-            fifo_lance::stats::summarize(&cfg).print();
+            fifo_gpu::stats::summarize(&cfg).print();
         }
         Cmd::Pack(args) => {
             println!("Packing {} → {} …", args.tradebook.display(), args.out.display());
             let t0 = std::time::Instant::now();
-            let st = fifo_lance::pack::pack(&args.tradebook, &args.out, args.page_records)?;
+            let st = fifo_gpu::pack::pack(&args.tradebook, &args.out, args.page_records)?;
             let dt = t0.elapsed();
             println!(
                 "Packed {} rows into {} partitions, {} pages, {:.1} MiB in {:.2}s",
@@ -269,7 +269,7 @@ fn main() -> Result<()> {
             let store = CheckpointStore::new(&args.checkpoints);
             let ckpt = matches!(span, Span::Range(..)).then_some(&store);
             let t0 = std::time::Instant::now();
-            let r = run_cpu(&table, ckpt, &q, &mut fifo_lance::fifo::NoopSink)?;
+            let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink)?;
             let dt = t0.elapsed();
             println!(
                 "Query: {:?} symbol={:?} span={:?}",
@@ -327,7 +327,7 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Bench(args) => {
-            fifo_lance::bench::run_bench(
+            fifo_gpu::bench::run_bench(
                 &args.tradebook,
                 &args.packed,
                 &args.checkpoints,
@@ -336,9 +336,9 @@ fn main() -> Result<()> {
         }
         Cmd::Stats(args) => {
             let manifest = Manifest::read(&args.out)?;
-            fifo_lance::stats::summarize(&manifest.config).print();
+            fifo_gpu::stats::summarize(&manifest.config).print();
             if args.verify_parquet {
-                let rows = fifo_lance::stats::count_parquet_rows(&args.out)?;
+                let rows = fifo_gpu::stats::count_parquet_rows(&args.out)?;
                 println!("\nparquet rows on disk: {}", rows);
                 println!("manifest realized   : {}", manifest.realized_total);
                 if rows == manifest.realized_total {

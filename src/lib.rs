@@ -1,4 +1,4 @@
-//! fifo_lance — Milestone 1: skew-realistic synthetic tradebook generator.
+//! fifo_gpu — Milestone 1: skew-realistic synthetic tradebook generator.
 //!
 //! Produces a `(client_id, symbol_id, ts)`-clustered tradebook (Parquet) whose
 //! trade-count-per-client distribution is an explicit power-law with whale

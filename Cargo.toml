@@ -1,5 +1,5 @@
 [package]
-name = "fifo_lance"
+name = "fifo_gpu"
 version = "0.1.0"
 edition = "2021"
 description = "GPU/CPU FIFO PnL on a transparent, Lance-shaped packed store"
@@ -9,7 +9,7 @@ name = "fifo"
 path = "src/main.rs"
 
 [lib]
-name = "fifo_lance"
+name = "fifo_gpu"
 path = "src/lib.rs"
 
 [dependencies]

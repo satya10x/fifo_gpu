@@ -1,4 +1,4 @@
-# fifo_lance — GPU/CPU FIFO PnL on a packed, Lance-shaped store
+# fifo_gpu — GPU/CPU FIFO PnL on a packed, Lance-shaped store
 
 Computes FIFO-based realized PnL (intraday / short-term ≤365d / long-term >365d)
 for an equities tradebook, on the fly, for arbitrary date ranges, per-client and

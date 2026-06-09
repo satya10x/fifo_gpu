@@ -1,4 +1,4 @@
-# fifo_lance — Benchmark summary & findings
+# fifo_gpu — Benchmark summary & findings
 
 GPU/CPU FIFO realized-PnL over a transparent, Lance-shaped packed store, with a
 cost-based router. This document summarizes what was built and the three
