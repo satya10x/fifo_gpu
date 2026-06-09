@@ -82,6 +82,10 @@ struct QRec {
     matches: bool,
     cpu_pnl: PartitionPnl,
     base_pnl: PartitionPnl,
+    /// For range queries: the same packed fold WITHOUT checkpoint carry-in
+    /// (folded from scratch). Lets a mismatch be attributed to the checkpoint
+    /// path vs a packed-vs-parquet data difference.
+    nockpt_pnl: Option<PartitionPnl>,
     gpu_ms: Option<f64>,
     gpu_h2d_ms: Option<f64>,
     gpu_kernel_ms: Option<f64>,
@@ -164,6 +168,13 @@ pub fn run_bench(
         let ((base_pnl, _base_rows), base_ms) = timed(|| baseline_query(tradebook_dir, q).unwrap());
         let matches = cpu_res.pnl == base_pnl;
 
+        // Diagnostic for range queries: fold the same packed data from scratch
+        // (no checkpoint). Splits a mismatch into checkpoint-carry vs packed-data.
+        let nockpt_pnl = match q.span {
+            Span::Range(..) => Some(run_cpu(&table, None, q, &mut NoopSink)?.pnl),
+            Span::Full => None,
+        };
+
         #[allow(unused_mut)]
         let (mut gpu_ms, mut gpu_h2d_ms, mut gpu_kernel_ms, mut gpu_matches): (
             Option<f64>,
@@ -199,6 +210,7 @@ pub fn run_bench(
             matches,
             cpu_pnl: cpu_res.pnl,
             base_pnl,
+            nockpt_pnl,
             gpu_ms,
             gpu_h2d_ms,
             gpu_kernel_ms,
@@ -254,6 +266,17 @@ pub fn run_bench(
             println!("    ⚠ PnL MISMATCH vs baseline!");
             println!("      cpu : {}", fmt_pnl(&r.cpu_pnl));
             println!("      base: {}", fmt_pnl(&r.base_pnl));
+            if let Some(nck) = r.nockpt_pnl {
+                println!("      nock: {}", fmt_pnl(&nck));
+                let ckpt_bad = r.cpu_pnl != nck;
+                let data_bad = nck != r.base_pnl;
+                match (ckpt_bad, data_bad) {
+                    (true, false) => println!("      → CHECKPOINT carry-in is wrong (cpu_ckpt ≠ cpu_nockpt; nockpt == baseline)"),
+                    (false, true) => println!("      → PACKED vs PARQUET differ (cpu_nockpt ≠ baseline; checkpoint is fine)"),
+                    (true, true) => println!("      → BOTH diverge (checkpoint AND packed-vs-parquet)"),
+                    (false, false) => println!("      → no divergence reproduced (transient?)"),
+                }
+            }
         }
         if r.gpu_matches == Some(false) {
             println!("    ⚠ GPU matched_qty != baseline for this query!");
