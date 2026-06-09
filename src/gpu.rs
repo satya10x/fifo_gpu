@@ -476,7 +476,10 @@ impl GpuEngine {
 
         // 3. two streams + two device buffer slots (double buffering)
         let streams = [self.dev.fork_default_stream()?, self.dev.fork_default_stream()?];
-        let mut d_recs: Vec<CudaSlice<PackedTrade>> = Vec::new();
+        // records as raw bytes (the kernel reinterprets as Rec*) — avoids needing
+        // DeviceRepr for PackedTrade, matching the serial fold_buffers path.
+        let rec_sz = std::mem::size_of::<PackedTrade>();
+        let mut d_recs: Vec<CudaSlice<u8>> = Vec::new();
         let mut d_off: Vec<CudaSlice<u64>> = Vec::new();
         let mut d_bigp: Vec<CudaSlice<u32>> = Vec::new();
         let mut d_cum: Vec<CudaSlice<i64>> = Vec::new();
@@ -487,7 +490,7 @@ impl GpuEngine {
         let mut d_qty: Vec<CudaSlice<i64>> = Vec::new();
         for _ in 0..2 {
             unsafe {
-                d_recs.push(self.dev.alloc::<PackedTrade>(max_rows)?);
+                d_recs.push(self.dev.alloc::<u8>(max_rows * rec_sz)?);
                 d_off.push(self.dev.alloc::<u64>(max_parts + 1)?);
                 d_bigp.push(self.dev.alloc::<u32>(max_parts)?);
                 d_cum.push(self.dev.alloc::<i64>(max_rows)?);
@@ -527,7 +530,8 @@ impl GpuEngine {
             unsafe {
                 // async H2D: records from the pinned host buffer (this overlaps);
                 // the tiny offset/index arrays are pageable (effectively sync).
-                result::memcpy_htod_async(*d_recs[slot].device_ptr(), &records[r0..r1], st)?;
+                let rec_bytes: &[u8] = bytemuck::cast_slice(&records[r0..r1]);
+                result::memcpy_htod_async(*d_recs[slot].device_ptr(), rec_bytes, st)?;
                 result::memcpy_htod_async(*d_off[slot].device_ptr(), &off_local, st)?;
                 if nbig > 0 {
                     result::memcpy_htod_async(*d_bigp[slot].device_ptr(), &big_local, st)?;
