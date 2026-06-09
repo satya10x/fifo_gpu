@@ -149,13 +149,13 @@ pub fn fold_core<S: FragmentSink>(
     for r in recs {
         if r.signed_qty > 0 {
             carry.push_back(Lot {
-                qty: r.signed_qty,
-                price_ticks: r.price_ticks,
+                qty: r.signed_qty as i64,
+                price_ticks: r.price_ticks as i64,
                 day: r.day,
             });
         } else if r.signed_qty < 0 {
-            let mut remaining = -r.signed_qty;
-            let sell_ticks = r.price_ticks;
+            let mut remaining = -(r.signed_qty as i64);
+            let sell_ticks = r.price_ticks as i64;
             let sell_day = r.day;
             let counted = match count {
                 Some((lo, hi)) => sell_day >= lo && sell_day <= hi,
@@ -232,8 +232,8 @@ pub fn fold_table<S: FragmentSink>(table: &PackedTable, sink: &mut S) -> Partiti
 mod tests {
     use super::*;
 
-    fn rec(sq: i64, px: i64, day: i32) -> PackedTrade {
-        PackedTrade { signed_qty: sq, price_ticks: px, day, _pad: 0, ts: day as i64 }
+    fn rec(sq: i32, px: i32, day: i32) -> PackedTrade {
+        PackedTrade { signed_qty: sq, price_ticks: px, day }
     }
 
     #[test]

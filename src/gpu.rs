@@ -56,8 +56,8 @@ const STREAM_CHUNK_ROWS: u64 = 4_000_000;
 const KERNEL: &str = r#"
 extern "C" {
 
-struct Rec  { long long signed_qty; long long price_ticks; int day; int pad; long long ts; }; // 32B
-struct Lot  { long long qty; long long price; int day; int pad; };                              // 24B
+struct Rec  { int signed_qty; int price_ticks; int day; };          // 12B, matches PackedTrade
+struct Lot  { long long qty; long long price; int day; int pad; };  // 24B (open-lot scratch)
 
 // ---- small-partition arm: one thread per partition, sequential FIFO drain ----
 __global__ void fifo_kernel(

@@ -118,8 +118,8 @@ mod tests {
     use super::*;
     use crate::packed::{PackedBuilder, PackedTable, PackedTrade};
 
-    fn rec(sq: i64, day: i32) -> PackedTrade {
-        PackedTrade { signed_qty: sq, price_ticks: 100, day, _pad: 0, ts: day as i64 }
+    fn rec(sq: i32, day: i32) -> PackedTrade {
+        PackedTrade { signed_qty: sq, price_ticks: 100, day }
     }
 
     #[test]

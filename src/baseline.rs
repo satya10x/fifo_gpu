@@ -95,11 +95,9 @@ pub fn baseline_query(tradebook_dir: &Path, q: &Query) -> Result<(PartitionPnl, 
                 }
                 let t = ts.value(i);
                 buf.push(PackedTrade {
-                    signed_qty: side.value(i) as i64 * qty.value(i) as i64,
+                    signed_qty: side.value(i) as i32 * qty.value(i) as i32,
                     price_ticks: crate::packed::price_to_ticks(price.value(i)),
                     day: (t / MICROS_PER_DAY) as i32,
-                    _pad: 0,
-                    ts: t,
                 });
             }
         }

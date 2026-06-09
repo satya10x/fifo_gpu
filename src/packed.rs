@@ -24,19 +24,24 @@ use std::io::{BufWriter, Write};
 use std::mem::size_of;
 use std::path::Path;
 
-/// One trade, packed for the FIFO kernel. `#[repr(C)]`, 32 bytes, no padding.
+/// One trade, packed for the FIFO kernel. `#[repr(C)]`, **12 bytes**, no padding.
+///
+/// `ts` is intentionally NOT stored: ordering is **positional** — records are
+/// written `(client, symbol, ts)`-sorted at build time, so the array index *is*
+/// time order and the fold never needs a per-row timestamp. Raw `ts` and audit
+/// context live in the wide tradebook. Dropping it (8 B) plus the old pad (4 B)
+/// took the record 32 → 12 B — pure H2D savings on the GPU hot path. Fields are
+/// `i32`: a single trade's quantity/price-ticks/day fit comfortably (accumulated
+/// PnL and qty stay wide — i128/i64 — in the fold, not in the record).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct PackedTrade {
     /// `+qty` for a buy, `-qty` for a sell (side ⊕ qty).
-    pub signed_qty: i64,
+    pub signed_qty: i32,
     /// Price in integer ticks (price / TICK), exact and fixed-width.
-    pub price_ticks: i64,
+    pub price_ticks: i32,
     /// Calendar day-index (days since epoch) — for intraday/short/long bucketing.
     pub day: i32,
-    pub _pad: i32,
-    /// Raw timestamp (µs) — kept for audit / tie-breaks; ordering is implicit.
-    pub ts: i64,
 }
 
 impl PackedTrade {
@@ -46,7 +51,7 @@ impl PackedTrade {
     }
     #[inline]
     pub fn qty(&self) -> i64 {
-        self.signed_qty.abs()
+        self.signed_qty.abs() as i64
     }
     #[inline]
     pub fn price(&self) -> f64 {
@@ -55,8 +60,8 @@ impl PackedTrade {
 }
 
 #[inline]
-pub fn price_to_ticks(price: f64) -> i64 {
-    (price / TICK).round() as i64
+pub fn price_to_ticks(price: f64) -> i32 {
+    (price / TICK).round() as i32
 }
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
@@ -65,11 +70,9 @@ impl PackedTrade {
     /// Convert a wide tradebook row into the packed FIFO tuple.
     pub fn from_trade(t: &crate::schema::Trade) -> Self {
         PackedTrade {
-            signed_qty: t.side as i64 * t.quantity as i64,
+            signed_qty: t.side as i32 * t.quantity as i32,
             price_ticks: price_to_ticks(t.price),
             day: (t.ts_micros / MICROS_PER_DAY) as i32,
-            _pad: 0,
-            ts: t.ts_micros,
         }
     }
 }
@@ -282,19 +285,13 @@ impl PackedTable {
 mod tests {
     use super::*;
 
-    fn rec(sq: i64, px: i64, day: i32) -> PackedTrade {
-        PackedTrade {
-            signed_qty: sq,
-            price_ticks: px,
-            day,
-            _pad: 0,
-            ts: day as i64 * 86_400_000_000,
-        }
+    fn rec(sq: i32, px: i32, day: i32) -> PackedTrade {
+        PackedTrade { signed_qty: sq, price_ticks: px, day }
     }
 
     #[test]
-    fn record_is_32_bytes() {
-        assert_eq!(size_of::<PackedTrade>(), 32);
+    fn record_is_12_bytes() {
+        assert_eq!(size_of::<PackedTrade>(), 12);
     }
 
     #[test]

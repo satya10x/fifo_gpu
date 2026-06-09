@@ -160,8 +160,8 @@ mod tests {
     use crate::fifo::{fold_partition, NoopSink};
     use crate::packed::{PackedBuilder, PackedTrade};
 
-    fn rec(sq: i64, px: i64, day: i32) -> PackedTrade {
-        PackedTrade { signed_qty: sq, price_ticks: px, day, _pad: 0, ts: day as i64 }
+    fn rec(sq: i32, px: i32, day: i32) -> PackedTrade {
+        PackedTrade { signed_qty: sq, price_ticks: px, day }
     }
 
     #[test]

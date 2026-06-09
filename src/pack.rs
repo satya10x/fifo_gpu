@@ -1,9 +1,16 @@
 //! The packer (M2): tradebook Parquet → packed compute table + page index.
 //!
 //! Streams the `(client,symbol,ts)`-sorted tradebook, cuts a new partition on
-//! every `(client,symbol)` change, converts each row to the 32-byte
+//! every `(client,symbol)` change, converts each row to the 12-byte
 //! [`PackedTrade`] tuple, and writes the transparent packed buffer + sidecar
 //! index.
+//!
+//! NOTE (ordering): the packed record drops `ts` — ordering is **positional**,
+//! so this relies on the input being `(client, symbol, ts)`-sorted with a
+//! deterministic tie-break for same-`ts` trades. The synthetic generator emits
+//! per-client deterministic order; a real tradebook must be sorted by
+//! `(client, symbol, ts, trade_id)` before packing. `ts` is still *read* here to
+//! derive `day`; it is simply not *stored* in the compute record.
 //!
 //! NOTE (scale): this builds the record buffer in RAM before writing. Fine for
 //! dev/benchmark scales (tens of millions of rows ≈ 1.5 GB). Production
@@ -86,14 +93,12 @@ pub fn pack(tradebook_dir: &Path, out_path: &Path, page_records: usize) -> Resul
                     }
                     cur = Some(key);
                 }
-                let signed_qty = side.value(i) as i64 * qty.value(i) as i64;
+                let signed_qty = side.value(i) as i32 * qty.value(i) as i32;
                 let t = ts.value(i);
                 cur_recs.push(PackedTrade {
                     signed_qty,
                     price_ticks: price_to_ticks(price.value(i)),
                     day: (t / MICROS_PER_DAY) as i32,
-                    _pad: 0,
-                    ts: t,
                 });
             }
         }
