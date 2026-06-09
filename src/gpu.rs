@@ -283,10 +283,42 @@ impl GpuEngine {
         &self,
         table: &PackedTable,
     ) -> Result<(Vec<[f64; 3]>, Vec<[i64; 3]>, GpuTiming)> {
-        let recs_bytes: &[u8] = bytemuck::cast_slice(table.records());
-        let offsets: &[u64] = table.part_offset();
-        let n_parts = table.n_parts() as i32;
-        let n_rows = table.n_rows() as usize;
+        self.fold_buffers(table.records(), table.part_offset())
+    }
+
+    /// Fold an arbitrary set of partitions (full-history, no range carry-in) by
+    /// gathering just those partitions' records into a contiguous buffer and
+    /// uploading only that — so the H2D cost reflects the *query*, not the whole
+    /// table. This is the per-query GPU arm the router calibrates against. Range
+    /// queries (which need checkpoint carry-in) stay on CPU and aren't folded here.
+    pub fn fold_query(
+        &self,
+        table: &PackedTable,
+        parts: &[usize],
+    ) -> Result<(PartitionPnl, GpuTiming)> {
+        let total: usize = parts.iter().map(|&p| table.partition(p).len()).sum();
+        let mut recs: Vec<crate::packed::PackedTrade> = Vec::with_capacity(total);
+        let mut offsets: Vec<u64> = Vec::with_capacity(parts.len() + 1);
+        offsets.push(0);
+        for &p in parts {
+            recs.extend_from_slice(table.partition(p));
+            offsets.push(recs.len() as u64);
+        }
+        let (realized, qty, timing) = self.fold_buffers(&recs, &offsets)?;
+        Ok((sum_pnl(&realized, &qty), timing))
+    }
+
+    /// Core GPU fold over a contiguous record buffer with prefix `offsets`
+    /// (length `n_parts + 1`, starting at 0). Shared by [`fold_all`] (whole
+    /// table) and [`fold_query`] (a gathered subset).
+    fn fold_buffers(
+        &self,
+        records: &[crate::packed::PackedTrade],
+        offsets: &[u64],
+    ) -> Result<(Vec<[f64; 3]>, Vec<[i64; 3]>, GpuTiming)> {
+        let recs_bytes: &[u8] = bytemuck::cast_slice(records);
+        let n_parts = (offsets.len() - 1) as i32;
+        let n_rows = records.len();
 
         // Split partitions: big ones (>= threshold) go to the within-partition
         // kernel, the rest to the one-thread-per-partition kernel.
@@ -389,24 +421,30 @@ impl GpuEngine {
     /// Whole-table totals as a [`PartitionPnl`] (realized PnL via f64 → ticks).
     pub fn fold_total(&self, table: &PackedTable) -> Result<(PartitionPnl, GpuTiming)> {
         let (realized, qty, timing) = self.fold_all(table)?;
-        let mut pnl = PartitionPnl::default();
-        for (r, q) in realized.iter().zip(qty.iter()) {
-            pnl.intraday.merge(&BucketPnl {
-                realized_ticks: r[0].round() as i128,
-                matched_qty: q[0] as i128,
-                fragments: 0,
-            });
-            pnl.short.merge(&BucketPnl {
-                realized_ticks: r[1].round() as i128,
-                matched_qty: q[1] as i128,
-                fragments: 0,
-            });
-            pnl.long.merge(&BucketPnl {
-                realized_ticks: r[2].round() as i128,
-                matched_qty: q[2] as i128,
-                fragments: 0,
-            });
-        }
-        Ok((pnl, timing))
+        Ok((sum_pnl(&realized, &qty), timing))
     }
+}
+
+/// Sum per-partition GPU outputs into a single [`PartitionPnl`] (realized PnL
+/// rounded from the on-device f64 accumulator back to integer ticks).
+fn sum_pnl(realized: &[[f64; 3]], qty: &[[i64; 3]]) -> PartitionPnl {
+    let mut pnl = PartitionPnl::default();
+    for (r, q) in realized.iter().zip(qty.iter()) {
+        pnl.intraday.merge(&BucketPnl {
+            realized_ticks: r[0].round() as i128,
+            matched_qty: q[0] as i128,
+            fragments: 0,
+        });
+        pnl.short.merge(&BucketPnl {
+            realized_ticks: r[1].round() as i128,
+            matched_qty: q[1] as i128,
+            fragments: 0,
+        });
+        pnl.long.merge(&BucketPnl {
+            realized_ticks: r[2].round() as i128,
+            matched_qty: q[2] as i128,
+            fragments: 0,
+        });
+    }
+    pnl
 }

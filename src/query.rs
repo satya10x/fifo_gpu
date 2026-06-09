@@ -45,7 +45,7 @@ pub struct QueryResult {
 }
 
 /// Partition indices selected by a query.
-fn select_partitions(table: &PackedTable, q: &Query) -> Vec<usize> {
+pub fn select_partitions(table: &PackedTable, q: &Query) -> Vec<usize> {
     match (q.clients, q.symbol) {
         (ClientSel::One(c), Some(s)) => table.find_partition(c, s).into_iter().collect(),
         (ClientSel::One(c), None) => table.partitions_for_client(c).collect(),

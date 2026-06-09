@@ -16,7 +16,7 @@ use crate::fifo::{NoopSink, PartitionPnl};
 use crate::manifest::Manifest;
 use crate::packed::PackedTable;
 use crate::query::{run_cpu, ClientSel, Query, Span};
-use crate::router::{self, Observation, RouterCoeffs};
+use crate::router::{self, Observation};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
@@ -58,8 +58,34 @@ struct BenchRow {
     cpu_ms: f64,
     baseline_ms: f64,
     speedup_vs_baseline: f64,
+    /// Per-query GPU arm (full-history queries only — ranges stay on CPU).
+    gpu_ms: Option<f64>,
+    gpu_h2d_ms: Option<f64>,
+    gpu_kernel_ms: Option<f64>,
+    gpu_matches_baseline: Option<bool>,
     routed_engine: String,
     pnl_matches_baseline: bool,
+}
+
+/// Everything measured for one query in phase 1, before the router is fit.
+/// Routing is decided in phase 2 from the *fitted* coefficients (so the route
+/// column reflects calibrated costs, not the cold-start priors).
+struct QRec {
+    name: String,
+    span: String,
+    rows: u64,
+    fanout: u64,
+    max_part: u64,
+    checkpoints: u64,
+    cpu_ms: f64,
+    base_ms: f64,
+    matches: bool,
+    cpu_pnl: PartitionPnl,
+    base_pnl: PartitionPnl,
+    gpu_ms: Option<f64>,
+    gpu_h2d_ms: Option<f64>,
+    gpu_kernel_ms: Option<f64>,
+    gpu_matches: Option<bool>,
 }
 
 /// Find the whale id with the most trades and a representative retail id.
@@ -126,96 +152,154 @@ pub fn run_bench(
         ("cross-client all-history".into(), Query { clients: ClientSel::All, symbol: None, span: Span::Full }),
     ];
 
-    let coeffs = RouterCoeffs::default();
-    let mut rows_out: Vec<BenchRow> = Vec::new();
-    let mut observations: Vec<Observation> = Vec::new();
+    // GPU engine for the per-query arm (full-history queries only; range queries
+    // need checkpoint carry-in and stay on CPU). Compiled once, reused per query.
+    #[cfg(feature = "gpu")]
+    let gpu_engine = crate::gpu::GpuEngine::new(0)?;
 
-    println!(
-        "{:<26} {:>10} {:>8} {:>10} {:>10} {:>11} {:>9} {:>7}",
-        "query", "rows", "parts", "maxpart", "cpu(ms)", "base(ms)", "speedup", "route"
-    );
-    println!("{}", "─".repeat(103));
-
+    // ---- phase 1: measure every query (CPU, baseline, and GPU where applicable) ----
+    let mut qrecs: Vec<QRec> = Vec::new();
     for (name, q) in &queries {
         let (cpu_res, cpu_ms) = timed(|| run_cpu(&table, Some(&store), q, &mut NoopSink).unwrap());
         let ((base_pnl, _base_rows), base_ms) = timed(|| baseline_query(tradebook_dir, q).unwrap());
         let matches = cpu_res.pnl == base_pnl;
 
-        let pred = coeffs.route(
-            cpu_res.rows_touched,
-            cpu_res.partition_fanout,
-            cpu_res.max_partition_rows,
-            cpu_res.checkpoints_loaded,
-        );
-        let speedup = if cpu_ms > 0.0 { base_ms / cpu_ms } else { 0.0 };
-
-        println!(
-            "{:<26} {:>10} {:>8} {:>10} {:>10.2} {:>11.2} {:>8.1}x {:>7}",
-            name,
-            cpu_res.rows_touched,
-            cpu_res.partition_fanout,
-            cpu_res.max_partition_rows,
-            cpu_ms,
-            base_ms,
-            speedup,
-            format!("{:?}", pred.engine)
-        );
-        if !matches {
-            println!("    ⚠ PnL MISMATCH vs baseline!");
-            println!("      cpu : {}", fmt_pnl(&cpu_res.pnl));
-            println!("      base: {}", fmt_pnl(&base_pnl));
+        #[allow(unused_mut)]
+        let (mut gpu_ms, mut gpu_h2d_ms, mut gpu_kernel_ms, mut gpu_matches): (
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<bool>,
+        ) = (None, None, None, None);
+        #[cfg(feature = "gpu")]
+        {
+            if let Span::Full = q.span {
+                let parts = crate::query::select_partitions(&table, q);
+                let (gpnl, t) = gpu_engine.fold_query(&table, &parts)?;
+                gpu_ms = Some(t.total_ms);
+                gpu_h2d_ms = Some(t.h2d_ms);
+                gpu_kernel_ms = Some(t.kernel_ms);
+                gpu_matches = Some(
+                    gpnl.intraday.matched_qty == base_pnl.intraday.matched_qty
+                        && gpnl.short.matched_qty == base_pnl.short.matched_qty
+                        && gpnl.long.matched_qty == base_pnl.long.matched_qty,
+                );
+            }
         }
 
-        observations.push(Observation {
+        qrecs.push(QRec {
+            name: name.clone(),
+            span: span_label(&q.span),
             rows: cpu_res.rows_touched,
             fanout: cpu_res.partition_fanout,
             max_part: cpu_res.max_partition_rows,
             checkpoints: cpu_res.checkpoints_loaded,
-            cpu_ns: cpu_ms * 1e6,
-            gpu_ns: None,
-        });
-        rows_out.push(BenchRow {
-            name: name.clone(),
-            span: span_label(&q.span),
-            rows_touched: cpu_res.rows_touched,
-            partition_fanout: cpu_res.partition_fanout,
-            max_partition_rows: cpu_res.max_partition_rows,
-            checkpoints: cpu_res.checkpoints_loaded,
             cpu_ms,
-            baseline_ms: base_ms,
-            speedup_vs_baseline: speedup,
-            routed_engine: format!("{:?}", pred.engine),
-            pnl_matches_baseline: matches,
+            base_ms,
+            matches,
+            cpu_pnl: cpu_res.pnl,
+            base_pnl,
+            gpu_ms,
+            gpu_h2d_ms,
+            gpu_kernel_ms,
+            gpu_matches,
         });
     }
 
-    // --- GPU arm (only with --features gpu on an NVIDIA box) ---
-    run_gpu_arm(&table)?;
-
-    // --- router fit ---
+    // ---- fit the router from the observations (incl. measured GPU H2D/kernel) ----
+    let observations: Vec<Observation> = qrecs
+        .iter()
+        .map(|r| Observation {
+            rows: r.rows,
+            fanout: r.fanout,
+            max_part: r.max_part,
+            checkpoints: r.checkpoints,
+            cpu_ns: r.cpu_ms * 1e6,
+            gpu_ns: r.gpu_ms.map(|x| x * 1e6),
+            gpu_h2d_ns: r.gpu_h2d_ms.map(|x| x * 1e6),
+            gpu_kernel_ns: r.gpu_kernel_ms.map(|x| x * 1e6),
+        })
+        .collect();
     let fitted = router::fit(&observations);
-    println!("\nRouter coefficients (fitted from CPU observations):");
-    println!("  cpu_per_row_ns      = {:.3}", fitted.cpu_per_row_ns);
-    println!("  gpu_per_row_ns      = {:.3}", fitted.gpu_per_row_ns);
-    println!("  h2d_per_row_ns      = {:.3}", fitted.h2d_per_row_ns);
-    println!("  launch_per_part_ns  = {:.1}", fitted.launch_per_partition_ns);
-    println!("  gpu_serial_per_row  = {:.5}", fitted.gpu_serial_per_row_ns);
-    for (obs, row) in observations.iter().zip(rows_out.iter()) {
-        let pred = fitted.route(obs.rows, obs.fanout, obs.max_part, obs.checkpoints);
-        let actual_ns = row.cpu_ms * 1e6;
+
+    // ---- phase 2: print the table, routing from the fitted coefficients ----
+    println!(
+        "{:<26} {:>10} {:>7} {:>10} {:>9} {:>9} {:>10} {:>8} {:>6}",
+        "query", "rows", "parts", "maxpart", "cpu(ms)", "gpu(ms)", "base(ms)", "vs base", "route"
+    );
+    println!("{}", "─".repeat(102));
+
+    let mut rows_out: Vec<BenchRow> = Vec::new();
+    for r in &qrecs {
+        let pred = fitted.route(r.rows, r.fanout, r.max_part, r.checkpoints);
+        let speedup = if r.cpu_ms > 0.0 { r.base_ms / r.cpu_ms } else { 0.0 };
+        let gpu_str = r
+            .gpu_ms
+            .map(|x| format!("{:.2}", x))
+            .unwrap_or_else(|| "-".into());
+
+        println!(
+            "{:<26} {:>10} {:>7} {:>10} {:>9.2} {:>9} {:>10.2} {:>7.1}x {:>6}",
+            r.name,
+            r.rows,
+            r.fanout,
+            r.max_part,
+            r.cpu_ms,
+            gpu_str,
+            r.base_ms,
+            speedup,
+            format!("{:?}", pred.engine)
+        );
+        if !r.matches {
+            println!("    ⚠ PnL MISMATCH vs baseline!");
+            println!("      cpu : {}", fmt_pnl(&r.cpu_pnl));
+            println!("      base: {}", fmt_pnl(&r.base_pnl));
+        }
+        if r.gpu_matches == Some(false) {
+            println!("    ⚠ GPU matched_qty != baseline for this query!");
+        }
+
+        let actual_ns = r.cpu_ms * 1e6;
         let _ = router::log_pred_vs_actual(
             router_log,
             &router::PredVsActual {
-                rows: obs.rows,
-                fanout: obs.fanout,
-                max_part: obs.max_part,
-                checkpoints: obs.checkpoints,
+                rows: r.rows,
+                fanout: r.fanout,
+                max_part: r.max_part,
+                checkpoints: r.checkpoints,
                 chosen: pred.engine,
                 predicted_ns: pred.cpu_ns.min(pred.gpu_ns),
                 actual_ns,
             },
         );
+        rows_out.push(BenchRow {
+            name: r.name.clone(),
+            span: r.span.clone(),
+            rows_touched: r.rows,
+            partition_fanout: r.fanout,
+            max_partition_rows: r.max_part,
+            checkpoints: r.checkpoints,
+            cpu_ms: r.cpu_ms,
+            baseline_ms: r.base_ms,
+            speedup_vs_baseline: speedup,
+            gpu_ms: r.gpu_ms,
+            gpu_h2d_ms: r.gpu_h2d_ms,
+            gpu_kernel_ms: r.gpu_kernel_ms,
+            gpu_matches_baseline: r.gpu_matches,
+            routed_engine: format!("{:?}", pred.engine),
+            pnl_matches_baseline: r.matches,
+        });
     }
+
+    // --- GPU full-table arm: detailed disk/H2D/kernel/D2H breakout (Decision 3) ---
+    run_gpu_arm(&table)?;
+
+    println!("\nRouter coefficients (fitted):");
+    println!("  cpu_per_row_ns      = {:.3}", fitted.cpu_per_row_ns);
+    println!("  gpu_per_row_ns      = {:.3}  (measured kernel)", fitted.gpu_per_row_ns);
+    println!("  h2d_per_row_ns      = {:.3}  (measured transfer)", fitted.h2d_per_row_ns);
+    println!("  launch_per_part_ns  = {:.1}", fitted.launch_per_partition_ns);
+    println!("  gpu_serial_per_row  = {:.5}", fitted.gpu_serial_per_row_ns);
     println!("  predicted-vs-actual logged to {}", router_log.display());
 
     let out_json = packed_path.with_extension("bench.json");

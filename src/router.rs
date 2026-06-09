@@ -100,43 +100,56 @@ pub struct Observation {
     pub checkpoints: u64,
     pub cpu_ns: f64,
     pub gpu_ns: Option<f64>,
+    /// Measured H2D and kernel times for this query's GPU run, when the GPU arm
+    /// ran it. These let [`fit`] calibrate the transfer and compute per-row
+    /// rates directly instead of trusting the priors.
+    pub gpu_h2d_ns: Option<f64>,
+    pub gpu_kernel_ns: Option<f64>,
 }
 
-/// Fit coefficients from observations. Per-row terms come from regressing time
-/// on rows; the GPU split between transfer and compute can't be separated from
-/// end-to-end timing alone, so we keep the transfer prior and attribute the
-/// remainder to compute. Falls back to the prior when a term is unobserved.
-pub fn fit(samples: &[Observation]) -> RouterCoeffs {
-    let mut c = RouterCoeffs::default();
-
-    // CPU: slope of cpu_ns vs rows through the origin (least squares: Σxy/Σx²).
+/// Least-squares slope through the origin: Σ(x·y)/Σx². Returns `None` if there
+/// is no signal (Σx² == 0).
+fn slope_through_origin<'a>(pts: impl Iterator<Item = (f64, f64)>) -> Option<f64> {
     let (mut sxy, mut sxx) = (0.0f64, 0.0f64);
-    for s in samples {
-        let x = s.rows as f64;
-        sxy += x * s.cpu_ns;
+    for (x, y) in pts {
+        sxy += x * y;
         sxx += x * x;
     }
     if sxx > 0.0 {
-        c.cpu_per_row_ns = (sxy / sxx).max(1e-3);
+        Some(sxy / sxx)
+    } else {
+        None
+    }
+}
+
+/// Fit coefficients from observations. CPU per-row from regressing cpu_ns on
+/// rows. When the GPU arm measured a query, we get its H2D and kernel times
+/// *separately*, so `h2d_per_row` and `gpu_per_row` are fit directly from the
+/// measured breakdown — no more guessing the transfer/compute split from an
+/// end-to-end number. Terms with no signal keep their prior.
+pub fn fit(samples: &[Observation]) -> RouterCoeffs {
+    let mut c = RouterCoeffs::default();
+
+    if let Some(m) = slope_through_origin(samples.iter().map(|s| (s.rows as f64, s.cpu_ns))) {
+        c.cpu_per_row_ns = m.max(1e-3);
     }
 
-    // GPU: regress (gpu_ns − gpu_fixed) on rows for the combined per-row rate;
-    // split per the transfer prior's share.
-    let gpu: Vec<&Observation> = samples.iter().filter(|s| s.gpu_ns.is_some()).collect();
-    if !gpu.is_empty() {
-        let (mut gsxy, mut gsxx) = (0.0f64, 0.0f64);
-        for s in &gpu {
-            let x = s.rows as f64;
-            let y = s.gpu_ns.unwrap() - c.gpu_fixed_ns;
-            gsxy += x * y;
-            gsxx += x * x;
-        }
-        if gsxx > 0.0 {
-            let combined = (gsxy / gsxx).max(1e-3);
-            let h2d_share = c.h2d_per_row_ns / (c.h2d_per_row_ns + c.gpu_per_row_ns);
-            c.h2d_per_row_ns = combined * h2d_share;
-            c.gpu_per_row_ns = combined * (1.0 - h2d_share);
-        }
+    // H2D transfer rate from measured per-query H2D times (Decision 3: this is
+    // the binding term, so calibrate it from the wire, not a prior).
+    if let Some(m) = slope_through_origin(
+        samples
+            .iter()
+            .filter_map(|s| s.gpu_h2d_ns.map(|y| (s.rows as f64, y))),
+    ) {
+        c.h2d_per_row_ns = m.max(1e-3);
+    }
+    // Kernel compute rate from measured per-query kernel times.
+    if let Some(m) = slope_through_origin(
+        samples
+            .iter()
+            .filter_map(|s| s.gpu_kernel_ns.map(|y| (s.rows as f64, y))),
+    ) {
+        c.gpu_per_row_ns = m.max(1e-4);
     }
     c
 }
@@ -186,6 +199,8 @@ mod tests {
                 checkpoints: 0,
                 cpu_ns: (i * 1000) as f64 * 4.0, // true slope 4 ns/row
                 gpu_ns: None,
+                gpu_h2d_ns: None,
+                gpu_kernel_ns: None,
             })
             .collect();
         let c = fit(&samples);
