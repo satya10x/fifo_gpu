@@ -467,20 +467,16 @@ impl GpuEngine {
             .max(1);
         let max_parts = chunks.iter().map(|&(a, b)| b - a).max().unwrap().max(1);
 
-        // 2. pinned host staging (one per slot). Async H2D overlaps the previous
-        // chunk's kernel only from page-locked memory; cuMemHostRegister on the
-        // read-only file-backed mmap fails, so allocate writable pinned staging
-        // via cuMemAllocHost and copy each chunk in. Pinning also lifts effective
-        // H2D bandwidth (pageable ~4 GB/s → pinned ~PCIe peak).
+        // 2. page-lock the whole records mmap so async H2D reads directly from it
+        // (no staging copy, and pinned bandwidth). It's a read-only file-backed
+        // mapping, so flag 0 fails — use CU_MEMHOSTREGISTER_READ_ONLY.
         let rec_sz = std::mem::size_of::<PackedTrade>();
-        let stage_bytes = max_rows * rec_sz;
-        let mut staging: [*mut std::ffi::c_void; 2] = [std::ptr::null_mut(); 2];
-        let mut pinned = true;
-        for i in 0..2 {
-            let ok = unsafe { sys::lib().cuMemAllocHost_v2(&mut staging[i] as *mut _, stage_bytes) }
-                == sys::CUresult::CUDA_SUCCESS;
-            pinned &= ok;
-        }
+        const CU_MEMHOSTREGISTER_READ_ONLY: std::ffi::c_uint = 0x08;
+        let host_ptr = records.as_ptr() as *mut std::ffi::c_void;
+        let host_bytes = records.len() * rec_sz;
+        let pinned = unsafe {
+            sys::lib().cuMemHostRegister_v2(host_ptr, host_bytes, CU_MEMHOSTREGISTER_READ_ONLY)
+        } == sys::CUresult::CUDA_SUCCESS;
 
         // 3. two streams + two device buffer slots (double buffering)
         let streams = [self.dev.fork_default_stream()?, self.dev.fork_default_stream()?];
@@ -530,21 +526,10 @@ impl GpuEngine {
 
             let st = streams[slot].stream;
             unsafe {
-                // async H2D: records from pinned staging (overlaps the prior
+                // async H2D straight from the page-locked mmap (overlaps the prior
                 // chunk's kernel); tiny offset/index arrays are pageable.
                 let rec_bytes: &[u8] = bytemuck::cast_slice(&records[r0..r1]);
-                if pinned {
-                    std::ptr::copy_nonoverlapping(
-                        rec_bytes.as_ptr(),
-                        staging[slot] as *mut u8,
-                        rec_bytes.len(),
-                    );
-                    let staged =
-                        std::slice::from_raw_parts(staging[slot] as *const u8, rec_bytes.len());
-                    result::memcpy_htod_async(*d_recs[slot].device_ptr(), staged, st)?;
-                } else {
-                    result::memcpy_htod_async(*d_recs[slot].device_ptr(), rec_bytes, st)?;
-                }
+                result::memcpy_htod_async(*d_recs[slot].device_ptr(), rec_bytes, st)?;
                 result::memcpy_htod_async(*d_off[slot].device_ptr(), &off_local, st)?;
                 if nbig > 0 {
                     result::memcpy_htod_async(*d_bigp[slot].device_ptr(), &big_local, st)?;
@@ -608,11 +593,9 @@ impl GpuEngine {
         let qv = self.dev.dtoh_sync_copy(&d_qty)?;
         let total_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-        for &s in staging.iter() {
-            if !s.is_null() {
-                unsafe {
-                    let _ = sys::lib().cuMemFreeHost(s);
-                }
+        if pinned {
+            unsafe {
+                let _ = sys::lib().cuMemHostUnregister(host_ptr);
             }
         }
 
