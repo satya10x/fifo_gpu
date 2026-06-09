@@ -28,11 +28,29 @@ pub enum Bucket {
     Long,
 }
 
+/// Data-driven bucket boundaries (Axis 1 of the generic engine — see DESIGN.md).
+/// A.1: configurable holding-period threshold + intraday-same-day. The default
+/// reproduces intraday / short (≤365d) / long (>365d); a different jurisdiction
+/// just sets `short_max_days`. K-bucket generalization is A.2.
+#[derive(Clone, Copy, Debug)]
+pub struct BucketRules {
+    /// `span == 0` → Intraday (otherwise it falls into the short/long bands).
+    pub intraday_same_day: bool,
+    /// Holding span ≤ this many days → Short; otherwise Long.
+    pub short_max_days: i32,
+}
+
+impl Default for BucketRules {
+    fn default() -> Self {
+        BucketRules { intraday_same_day: true, short_max_days: LONG_TERM_DAYS }
+    }
+}
+
 #[inline]
-pub fn classify(buy_day: i32, sell_day: i32) -> Bucket {
-    if buy_day == sell_day {
+pub fn classify(rules: &BucketRules, buy_day: i32, sell_day: i32) -> Bucket {
+    if rules.intraday_same_day && buy_day == sell_day {
         Bucket::Intraday
-    } else if sell_day - buy_day <= LONG_TERM_DAYS {
+    } else if sell_day - buy_day <= rules.short_max_days {
         Bucket::Short
     } else {
         Bucket::Long
@@ -144,6 +162,7 @@ pub fn fold_core<S: FragmentSink>(
     recs: &[PackedTrade],
     sink: &mut S,
     count: Option<(i32, i32)>,
+    rules: &BucketRules,
 ) -> PartitionPnl {
     let mut pnl = PartitionPnl::default();
     for r in recs {
@@ -168,7 +187,7 @@ pub fn fold_core<S: FragmentSink>(
                 };
                 let matched = remaining.min(front.qty);
                 if counted {
-                    let bucket = classify(front.day, sell_day);
+                    let bucket = classify(rules, front.day, sell_day);
                     let frag = Fragment {
                         client,
                         symbol,
@@ -193,7 +212,10 @@ pub fn fold_core<S: FragmentSink>(
     pnl
 }
 
-/// Fold from a carry queue, counting every fragment.
+/// Fold from a carry queue, counting every fragment, with the **default**
+/// bucket rules. Custom rules go through [`fold_core`] directly (the live query
+/// path); this convenience wrapper and its callers (tests, rollup, correction,
+/// full-table bench) use the default ruleset.
 pub fn fold_with_carry<S: FragmentSink>(
     client: u64,
     symbol: u32,
@@ -201,7 +223,7 @@ pub fn fold_with_carry<S: FragmentSink>(
     recs: &[PackedTrade],
     sink: &mut S,
 ) -> PartitionPnl {
-    fold_core(client, symbol, carry, recs, sink, None)
+    fold_core(client, symbol, carry, recs, sink, None, &BucketRules::default())
 }
 
 /// Fold a partition from a flat (no carry-in) state.
@@ -234,6 +256,26 @@ mod tests {
 
     fn rec(sq: i32, px: i32, day: i32) -> PackedTrade {
         PackedTrade { signed_qty: sq, price_ticks: px, day }
+    }
+
+    #[test]
+    fn bucket_rules_reclassify_by_threshold() {
+        // a single 200-day-held round trip
+        let recs = [rec(100, 1000, 0), rec(-100, 1200, 200)];
+        // default (≤365 → short): 200 days is short-term
+        let mut c1 = VecDeque::new();
+        let d = fold_core(1, 1, &mut c1, &recs, &mut NoopSink, None, &BucketRules::default());
+        assert_eq!(d.short.matched_qty, 100);
+        assert_eq!(d.long.matched_qty, 0);
+        // stricter jurisdiction (≤100 → short): the same trade is now long-term
+        let mut c2 = VecDeque::new();
+        let s = fold_core(
+            1, 1, &mut c2, &recs, &mut NoopSink, None,
+            &BucketRules { intraday_same_day: true, short_max_days: 100 },
+        );
+        assert_eq!(s.short.matched_qty, 0);
+        assert_eq!(s.long.matched_qty, 100);
+        assert_eq!(s.long.realized_ticks, 100 * (1200 - 1000)); // PnL identical, bucket differs
     }
 
     #[test]

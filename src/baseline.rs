@@ -5,7 +5,7 @@
 //! range query it folds the matched partitions' *entire* history (the
 //! checkpoint-free cost) and counts only the in-range sells.
 
-use crate::fifo::{fold_core, NoopSink, PartitionPnl};
+use crate::fifo::{fold_core, BucketRules, NoopSink, PartitionPnl};
 use crate::packed::PackedTrade;
 use crate::query::{ClientSel, Query, Span};
 use anyhow::{Context, Result};
@@ -66,7 +66,7 @@ pub fn baseline_query(tradebook_dir: &Path, q: &Query) -> Result<(PartitionPnl, 
             if matches(q, key.0, key.1) {
                 *rows += buf.len() as u64;
                 let mut carry: VecDeque<_> = VecDeque::new();
-                pnl.merge(&fold_core(key.0, key.1, &mut carry, buf, &mut NoopSink, count));
+                pnl.merge(&fold_core(key.0, key.1, &mut carry, buf, &mut NoopSink, count, &BucketRules::default()));
             }
             buf.clear();
         }

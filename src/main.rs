@@ -94,6 +94,11 @@ struct QueryArgs {
     /// Checkpoint dir (used for range carry-in).
     #[arg(long, default_value = "data/checkpoints")]
     checkpoints: PathBuf,
+    /// Holding-period (days) at/below which a round-trip is short-term; above is
+    /// long-term. Jurisdiction-configurable (e.g. 365). Intraday (same-day) is
+    /// always its own bucket. See DESIGN.md (Axis 1).
+    #[arg(long, default_value_t = fifo_gpu::fifo::LONG_TERM_DAYS)]
+    ltcg_days: i32,
 }
 
 #[derive(Parser)]
@@ -268,8 +273,12 @@ fn main() -> Result<()> {
             let q = Query { clients, symbol: args.symbol, span };
             let store = CheckpointStore::new(&args.checkpoints);
             let ckpt = matches!(span, Span::Range(..)).then_some(&store);
+            let rules = fifo_gpu::fifo::BucketRules {
+                intraday_same_day: true,
+                short_max_days: args.ltcg_days,
+            };
             let t0 = std::time::Instant::now();
-            let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink)?;
+            let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink, &rules)?;
             let dt = t0.elapsed();
             println!(
                 "Query: {:?} symbol={:?} span={:?}",

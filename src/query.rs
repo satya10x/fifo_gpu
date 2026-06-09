@@ -7,7 +7,7 @@
 //! router (M7) needs: `rows_touched`, `partition_fanout`, `checkpoints_loaded`.
 
 use crate::checkpoint::CheckpointStore;
-use crate::fifo::{fold_core, FragmentSink, PartitionPnl};
+use crate::fifo::{fold_core, BucketRules, FragmentSink, PartitionPnl};
 use crate::packed::PackedTable;
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -63,6 +63,7 @@ pub fn run_cpu<S: FragmentSink>(
     ckpt: Option<&CheckpointStore>,
     q: &Query,
     sink: &mut S,
+    rules: &BucketRules,
 ) -> Result<QueryResult> {
     let pc = table.part_client();
     let ps = table.part_symbol();
@@ -87,7 +88,7 @@ pub fn run_cpu<S: FragmentSink>(
                 out.rows_touched += recs.len() as u64;
                 out.max_partition_rows = out.max_partition_rows.max(recs.len() as u64);
                 let mut carry = VecDeque::new();
-                fold_core(client, symbol, &mut carry, recs, sink, None)
+                fold_core(client, symbol, &mut carry, recs, sink, None, rules)
             }
             Span::Range(lo, hi) => {
                 let mut carry = ckpt_snap
@@ -101,7 +102,7 @@ pub fn run_cpu<S: FragmentSink>(
                 let replay = table.day_range(recs, cutoff.saturating_add(1), hi);
                 out.rows_touched += replay.len() as u64;
                 out.max_partition_rows = out.max_partition_rows.max(replay.len() as u64);
-                fold_core(client, symbol, &mut carry, replay, sink, Some((lo, hi)))
+                fold_core(client, symbol, &mut carry, replay, sink, Some((lo, hi)), rules)
             }
         };
         out.pnl.merge(&part_pnl);
@@ -132,7 +133,7 @@ mod tests {
         let t = PackedTable::open(&path).unwrap();
 
         let q = Query { clients: ClientSel::One(7), symbol: None, span: Span::Full };
-        let r = run_cpu(&t, None, &q, &mut NoopSink).unwrap();
+        let r = run_cpu(&t, None, &q, &mut NoopSink, &BucketRules::default()).unwrap();
 
         let mut want = fold_partition(7, 1, &a, &mut NoopSink);
         want.merge(&fold_partition(7, 2, &c, &mut NoopSink));
