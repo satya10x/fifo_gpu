@@ -34,7 +34,7 @@ use crate::fifo::{BucketPnl, PartitionPnl};
 use crate::packed::PackedTable;
 use anyhow::{Context, Result};
 use cudarc::driver::{
-    result, sys, CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig,
+    result, sys, CudaDevice, CudaSlice, DevicePtr, DeviceSlice, LaunchAsync, LaunchConfig,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
