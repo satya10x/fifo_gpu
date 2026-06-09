@@ -13,24 +13,14 @@ use fifo_gpu::rollup::Rollup;
 use fifo_gpu::{calendar, correction};
 use std::path::PathBuf;
 
-fn print_pnl(p: &PartitionPnl) {
+fn print_pnl(rules: &fifo_gpu::fifo::BucketRules, p: &PartitionPnl) {
+    for i in 0..rules.num_buckets() {
+        let b = &p.buckets[i];
+        println!("  {:<10}: {:>16.2}   (qty {})", rules.label(i), b.value(), b.matched_qty);
+    }
     println!(
-        "  intraday : {:>16.2}   (qty {})",
-        p.intraday.value(),
-        p.intraday.matched_qty
-    );
-    println!(
-        "  short    : {:>16.2}   (qty {})",
-        p.short.value(),
-        p.short.matched_qty
-    );
-    println!(
-        "  long     : {:>16.2}   (qty {})",
-        p.long.value(),
-        p.long.matched_qty
-    );
-    println!(
-        "  TOTAL    : {:>16.2}",
+        "  {:<10}: {:>16.2}",
+        "TOTAL",
         (p.total_ticks() as f64) * fifo_gpu::generate::TICK
     );
 }
@@ -99,6 +89,11 @@ struct QueryArgs {
     /// always its own bucket. See DESIGN.md (Axis 1).
     #[arg(long, default_value_t = fifo_gpu::fifo::LONG_TERM_DAYS)]
     ltcg_days: i32,
+    /// Arbitrary K-bucket bands: comma-separated ascending holding-day bounds
+    /// (e.g. `--bands 30,365` → intraday/≤30d/≤365d/>365d). Overrides --ltcg-days.
+    /// See DESIGN.md (Axis 1, A.2).
+    #[arg(long)]
+    bands: Option<String>,
     /// Lot-matching policy: `fifo` | `lifo` | `hifo`. See DESIGN.md (Axis 2).
     /// Non-FIFO is CPU-only and (for range queries) needs policy-matched
     /// checkpoints; full-history is fine on any policy.
@@ -278,9 +273,16 @@ fn main() -> Result<()> {
             let q = Query { clients, symbol: args.symbol, span };
             let store = CheckpointStore::new(&args.checkpoints);
             let ckpt = matches!(span, Span::Range(..)).then_some(&store);
-            let rules = fifo_gpu::fifo::BucketRules {
-                intraday_same_day: true,
-                short_max_days: args.ltcg_days,
+            let rules = match &args.bands {
+                Some(s) => {
+                    let bounds: Vec<i32> = s
+                        .split(',')
+                        .map(|x| x.trim().parse())
+                        .collect::<std::result::Result<_, _>>()
+                        .map_err(|e| anyhow::anyhow!("bad --bands {s:?}: {e}"))?;
+                    fifo_gpu::fifo::BucketRules::bands(true, &bounds)
+                }
+                None => fifo_gpu::fifo::BucketRules::equity(args.ltcg_days),
             };
             use fifo_gpu::fifo::MatchPolicy;
             let policy = match args.policy.as_str() {
@@ -303,7 +305,7 @@ fn main() -> Result<()> {
                 r.checkpoints_loaded,
                 dt.as_secs_f64() * 1e3
             );
-            print_pnl(&r.pnl);
+            print_pnl(&rules, &r.pnl);
         }
         Cmd::Rollup(args) => {
             let table = PackedTable::open(&args.packed)?;
@@ -319,7 +321,7 @@ fn main() -> Result<()> {
                 args.out.display()
             );
             println!("Cross-client total (all periods):");
-            print_pnl(&total);
+            print_pnl(&fifo_gpu::fifo::BucketRules::default(), &total);
         }
         Cmd::Correct(args) => {
             let manifest = Manifest::read(&args.tradebook)?;
@@ -335,7 +337,7 @@ fn main() -> Result<()> {
                 "  regenerated {} trades across {} partitions (deterministic, isolated)",
                 report.n_trades, report.n_partitions
             );
-            print_pnl(&report.pnl);
+            print_pnl(&fifo_gpu::fifo::BucketRules::default(), &report.pnl);
             println!(
                 "  checkpoints to rebuild (cutoff ≥ {}): {:?}",
                 day, report.invalidated_checkpoints

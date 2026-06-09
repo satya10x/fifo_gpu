@@ -195,7 +195,7 @@ mod tests {
         let got = fold_core(1, 1, &mut carry, replay, &mut NoopSink, Some((150, 250)), &BucketRules::default(), MatchPolicy::Fifo);
 
         assert_eq!(got, truth);
-        assert_eq!(got.short.matched_qty, 150); // the d200 sell crossed both lots
+        assert_eq!(got.short().matched_qty, 150); // the d200 sell crossed both lots
         let _ = std::fs::remove_file(&path);
     }
 

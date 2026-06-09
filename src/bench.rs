@@ -38,12 +38,12 @@ fn span_label(s: &Span) -> String {
 fn fmt_pnl(p: &PartitionPnl) -> String {
     format!(
         "intra={:.0} short={:.0} long={:.0} (qty {}/{}/{})",
-        p.intraday.value(),
-        p.short.value(),
-        p.long.value(),
-        p.intraday.matched_qty,
-        p.short.matched_qty,
-        p.long.matched_qty
+        p.intraday().value(),
+        p.short().value(),
+        p.long().value(),
+        p.intraday().matched_qty,
+        p.short().matched_qty,
+        p.long().matched_qty
     )
 }
 
@@ -196,9 +196,9 @@ pub fn run_bench(
                 gpu_h2d_ms = Some(t.h2d_ms);
                 gpu_kernel_ms = Some(t.kernel_ms);
                 gpu_matches = Some(
-                    gpnl.intraday.matched_qty == base_pnl.intraday.matched_qty
-                        && gpnl.short.matched_qty == base_pnl.short.matched_qty
-                        && gpnl.long.matched_qty == base_pnl.long.matched_qty,
+                    gpnl.intraday().matched_qty == base_pnl.intraday().matched_qty
+                        && gpnl.short().matched_qty == base_pnl.short().matched_qty
+                        && gpnl.long().matched_qty == base_pnl.long().matched_qty,
                 );
             }
         }
@@ -350,16 +350,16 @@ fn run_gpu_arm(table: &PackedTable) -> Result<()> {
     );
     println!("  CPU full-table fold: {:.1} ms", cpu_ms);
     // validate: matched_qty exact, realized PnL within f64 tolerance
-    let q_match = gpu_pnl.intraday.matched_qty == cpu_pnl.intraday.matched_qty
-        && gpu_pnl.short.matched_qty == cpu_pnl.short.matched_qty
-        && gpu_pnl.long.matched_qty == cpu_pnl.long.matched_qty;
+    let q_match = gpu_pnl.intraday().matched_qty == cpu_pnl.intraday().matched_qty
+        && gpu_pnl.short().matched_qty == cpu_pnl.short().matched_qty
+        && gpu_pnl.long().matched_qty == cpu_pnl.long().matched_qty;
     let rel = |a: i128, b: i128| {
         let (a, b) = (a as f64, b as f64);
         if b.abs() < 1.0 { (a - b).abs() } else { ((a - b) / b).abs() }
     };
-    let pnl_ok = rel(gpu_pnl.intraday.realized_ticks, cpu_pnl.intraday.realized_ticks) < 1e-6
-        && rel(gpu_pnl.short.realized_ticks, cpu_pnl.short.realized_ticks) < 1e-6
-        && rel(gpu_pnl.long.realized_ticks, cpu_pnl.long.realized_ticks) < 1e-6;
+    let pnl_ok = rel(gpu_pnl.intraday().realized_ticks, cpu_pnl.intraday().realized_ticks) < 1e-6
+        && rel(gpu_pnl.short().realized_ticks, cpu_pnl.short().realized_ticks) < 1e-6
+        && rel(gpu_pnl.long().realized_ticks, cpu_pnl.long().realized_ticks) < 1e-6;
     println!(
         "  validation vs CPU oracle: matched_qty {}, realized {}",
         if q_match { "EXACT ✓" } else { "MISMATCH ✗" },
@@ -371,12 +371,12 @@ fn run_gpu_arm(table: &PackedTable) -> Result<()> {
     // overlap and bounded VRAM. Compare its end-to-end total to the serial total.
     println!("\n── GPU streamed arm (2 streams + pinned, H2D/kernel overlap) ──");
     let (s_pnl, s_ms, pinned) = eng.fold_total_streamed(table)?;
-    let s_qmatch = s_pnl.intraday.matched_qty == cpu_pnl.intraday.matched_qty
-        && s_pnl.short.matched_qty == cpu_pnl.short.matched_qty
-        && s_pnl.long.matched_qty == cpu_pnl.long.matched_qty;
-    let s_pnl_ok = rel(s_pnl.intraday.realized_ticks, cpu_pnl.intraday.realized_ticks) < 1e-6
-        && rel(s_pnl.short.realized_ticks, cpu_pnl.short.realized_ticks) < 1e-6
-        && rel(s_pnl.long.realized_ticks, cpu_pnl.long.realized_ticks) < 1e-6;
+    let s_qmatch = s_pnl.intraday().matched_qty == cpu_pnl.intraday().matched_qty
+        && s_pnl.short().matched_qty == cpu_pnl.short().matched_qty
+        && s_pnl.long().matched_qty == cpu_pnl.long().matched_qty;
+    let s_pnl_ok = rel(s_pnl.intraday().realized_ticks, cpu_pnl.intraday().realized_ticks) < 1e-6
+        && rel(s_pnl.short().realized_ticks, cpu_pnl.short().realized_ticks) < 1e-6
+        && rel(s_pnl.long().realized_ticks, cpu_pnl.long().realized_ticks) < 1e-6;
     println!(
         "  total: {:.1} ms (host pinned: {})  vs serial GPU total {:.1} ms  →  {:.2}× overlap speedup",
         s_ms,

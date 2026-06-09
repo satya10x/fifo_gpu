@@ -608,23 +608,17 @@ impl GpuEngine {
 /// Sum per-partition GPU outputs into a single [`PartitionPnl`] (realized PnL
 /// rounded from the on-device f64 accumulator back to integer ticks).
 fn sum_pnl(realized: &[[f64; 3]], qty: &[[i64; 3]]) -> PartitionPnl {
+    // The GPU kernel emits the 3 default buckets (intraday/short/long = 0/1/2);
+    // K-bucket rulesets are CPU-only (see DESIGN.md A.3).
     let mut pnl = PartitionPnl::default();
     for (r, q) in realized.iter().zip(qty.iter()) {
-        pnl.intraday.merge(&BucketPnl {
-            realized_ticks: r[0].round() as i128,
-            matched_qty: q[0] as i128,
-            fragments: 0,
-        });
-        pnl.short.merge(&BucketPnl {
-            realized_ticks: r[1].round() as i128,
-            matched_qty: q[1] as i128,
-            fragments: 0,
-        });
-        pnl.long.merge(&BucketPnl {
-            realized_ticks: r[2].round() as i128,
-            matched_qty: q[2] as i128,
-            fragments: 0,
-        });
+        for b in 0..3 {
+            pnl.bucket_mut(b).merge(&BucketPnl {
+                realized_ticks: r[b].round() as i128,
+                matched_qty: q[b] as i128,
+                fragments: 0,
+            });
+        }
     }
     pnl
 }

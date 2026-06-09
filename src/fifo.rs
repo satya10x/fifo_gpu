@@ -21,28 +21,62 @@ use std::collections::VecDeque;
 
 pub const LONG_TERM_DAYS: i32 = 365;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bucket {
-    Intraday,
-    Short,
-    Long,
-}
+/// Max buckets a ruleset can define. 8 covers any realistic holding-period tax
+/// regime (intraday + several bands).
+pub const MAX_BUCKETS: usize = 8;
 
-/// Data-driven bucket boundaries (Axis 1 of the generic engine — see DESIGN.md).
-/// A.1: configurable holding-period threshold + intraday-same-day. The default
-/// reproduces intraday / short (≤365d) / long (>365d); a different jurisdiction
-/// just sets `short_max_days`. K-bucket generalization is A.2.
+/// Data-driven bucket rules (Axis 1 of the generic engine — see DESIGN.md).
+/// Classifies a matched fragment into one of up to [`MAX_BUCKETS`] buckets by
+/// holding-period band: `intraday_same_day` puts same-day round-trips in bucket
+/// 0; `boundaries` (ascending; first `n_bounds` used) are inclusive holding-day
+/// upper bounds for each following band; anything past the last lands in the
+/// final (e.g. long-term) bucket. The default reproduces intraday/short≤365/long.
 #[derive(Clone, Copy, Debug)]
 pub struct BucketRules {
-    /// `span == 0` → Intraday (otherwise it falls into the short/long bands).
     pub intraday_same_day: bool,
-    /// Holding span ≤ this many days → Short; otherwise Long.
-    pub short_max_days: i32,
+    pub boundaries: [i32; MAX_BUCKETS],
+    pub n_bounds: usize,
 }
 
 impl Default for BucketRules {
     fn default() -> Self {
-        BucketRules { intraday_same_day: true, short_max_days: LONG_TERM_DAYS }
+        BucketRules::equity(LONG_TERM_DAYS)
+    }
+}
+
+impl BucketRules {
+    /// intraday + one short/long threshold (the common equity case).
+    pub fn equity(short_max_days: i32) -> Self {
+        let mut boundaries = [0; MAX_BUCKETS];
+        boundaries[0] = short_max_days;
+        BucketRules { intraday_same_day: true, boundaries, n_bounds: 1 }
+    }
+    /// intraday + arbitrary ascending holding-day bands (e.g. multi-tier regimes).
+    pub fn bands(intraday_same_day: bool, bounds: &[i32]) -> Self {
+        let mut boundaries = [0; MAX_BUCKETS];
+        let n = bounds.len().min(MAX_BUCKETS);
+        boundaries[..n].copy_from_slice(&bounds[..n]);
+        BucketRules { intraday_same_day, boundaries, n_bounds: n }
+    }
+    /// Number of buckets this ruleset produces.
+    pub fn num_buckets(&self) -> usize {
+        usize::from(self.intraday_same_day) + self.n_bounds + 1
+    }
+    /// Human label for bucket `i` (e.g. "intraday", "0-365d", ">365d").
+    pub fn label(&self, i: usize) -> String {
+        let mut idx = i;
+        if self.intraday_same_day {
+            if idx == 0 {
+                return "intraday".into();
+            }
+            idx -= 1;
+        }
+        if idx < self.n_bounds {
+            let lo = if idx == 0 { if self.intraday_same_day { 1 } else { 0 } } else { self.boundaries[idx - 1] + 1 };
+            format!("{}-{}d", lo, self.boundaries[idx])
+        } else {
+            format!(">{}d", self.boundaries[self.n_bounds - 1])
+        }
     }
 }
 
@@ -80,15 +114,24 @@ fn pick_lot(carry: &VecDeque<Lot>, policy: MatchPolicy) -> usize {
     }
 }
 
+/// Bucket index (0..`num_buckets`) for a matched fragment under `rules`.
 #[inline]
-pub fn classify(rules: &BucketRules, buy_day: i32, sell_day: i32) -> Bucket {
-    if rules.intraday_same_day && buy_day == sell_day {
-        Bucket::Intraday
-    } else if sell_day - buy_day <= rules.short_max_days {
-        Bucket::Short
+pub fn classify(rules: &BucketRules, buy_day: i32, sell_day: i32) -> usize {
+    let span = sell_day - buy_day;
+    let base = if rules.intraday_same_day {
+        if span == 0 {
+            return 0;
+        }
+        1
     } else {
-        Bucket::Long
+        0
+    };
+    for i in 0..rules.n_bounds {
+        if span <= rules.boundaries[i] {
+            return base + i;
+        }
     }
+    base + rules.n_bounds
 }
 
 /// An open buy lot awaiting a matching sell.
@@ -109,7 +152,8 @@ pub struct Fragment {
     pub matched_qty: i64,
     pub buy_ticks: i64,
     pub sell_ticks: i64,
-    pub bucket: Bucket,
+    /// Bucket index (0..`num_buckets`) under the active [`BucketRules`].
+    pub bucket: usize,
 }
 
 impl Fragment {
@@ -157,28 +201,40 @@ impl BucketPnl {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PartitionPnl {
-    pub intraday: BucketPnl,
-    pub short: BucketPnl,
-    pub long: BucketPnl,
+    /// One [`BucketPnl`] per bucket (0..`num_buckets`); unused tail stays zero.
+    pub buckets: [BucketPnl; MAX_BUCKETS],
+}
+
+impl Default for PartitionPnl {
+    fn default() -> Self {
+        PartitionPnl { buckets: [BucketPnl::default(); MAX_BUCKETS] }
+    }
 }
 
 impl PartitionPnl {
-    pub fn bucket_mut(&mut self, b: Bucket) -> &mut BucketPnl {
-        match b {
-            Bucket::Intraday => &mut self.intraday,
-            Bucket::Short => &mut self.short,
-            Bucket::Long => &mut self.long,
-        }
+    #[inline]
+    pub fn bucket_mut(&mut self, i: usize) -> &mut BucketPnl {
+        &mut self.buckets[i]
     }
     pub fn merge(&mut self, o: &PartitionPnl) {
-        self.intraday.merge(&o.intraday);
-        self.short.merge(&o.short);
-        self.long.merge(&o.long);
+        for i in 0..MAX_BUCKETS {
+            self.buckets[i].merge(&o.buckets[i]);
+        }
     }
     pub fn total_ticks(&self) -> i128 {
-        self.intraday.realized_ticks + self.short.realized_ticks + self.long.realized_ticks
+        self.buckets.iter().map(|b| b.realized_ticks).sum()
+    }
+    // Convenience accessors for the default ruleset (intraday/short/long = 0/1/2).
+    pub fn intraday(&self) -> &BucketPnl {
+        &self.buckets[0]
+    }
+    pub fn short(&self) -> &BucketPnl {
+        &self.buckets[1]
+    }
+    pub fn long(&self) -> &BucketPnl {
+        &self.buckets[2]
     }
 }
 
@@ -307,17 +363,37 @@ mod tests {
         // default (≤365 → short): 200 days is short-term
         let mut c1 = VecDeque::new();
         let d = fold_core(1, 1, &mut c1, &recs, &mut NoopSink, None, &BucketRules::default(), MatchPolicy::Fifo);
-        assert_eq!(d.short.matched_qty, 100);
-        assert_eq!(d.long.matched_qty, 0);
+        assert_eq!(d.short().matched_qty, 100);
+        assert_eq!(d.long().matched_qty, 0);
         // stricter jurisdiction (≤100 → short): the same trade is now long-term
         let mut c2 = VecDeque::new();
         let s = fold_core(
             1, 1, &mut c2, &recs, &mut NoopSink, None,
-            &BucketRules { intraday_same_day: true, short_max_days: 100 },
+            &BucketRules::equity(100),
             MatchPolicy::Fifo,
         );
-        assert_eq!(s.short.matched_qty, 0);
-        assert_eq!(s.long.matched_qty, 100);
+        assert_eq!(s.short().matched_qty, 0);
+        assert_eq!(s.long().matched_qty, 100);
+    }
+
+    #[test]
+    fn k_bucket_rules_classify_and_fold() {
+        // intraday + two bands → 4 buckets: 0=intraday, 1=≤30d, 2=≤365d, 3=>365d
+        let rules = BucketRules::bands(true, &[30, 365]);
+        assert_eq!(rules.num_buckets(), 4);
+        assert_eq!(classify(&rules, 5, 5), 0);
+        assert_eq!(classify(&rules, 0, 10), 1);
+        assert_eq!(classify(&rules, 0, 200), 2);
+        assert_eq!(classify(&rules, 0, 500), 3);
+        // a 200-day round trip lands in bucket 2, nothing elsewhere
+        let recs = [rec(100, 1000, 0), rec(-100, 1200, 200)];
+        let mut c = VecDeque::new();
+        let pnl = fold_core(1, 1, &mut c, &recs, &mut NoopSink, None, &rules, MatchPolicy::Fifo);
+        assert_eq!(pnl.buckets[2].matched_qty, 100);
+        assert_eq!(pnl.buckets[2].realized_ticks, 100 * 200);
+        assert_eq!(pnl.buckets[0].matched_qty, 0);
+        assert_eq!(pnl.buckets[1].matched_qty, 0);
+        assert_eq!(pnl.buckets[3].matched_qty, 0);
     }
 
     #[test]
@@ -334,11 +410,11 @@ mod tests {
             fold_core(1, 1, &mut c, &recs, &mut NoopSink, None, &BucketRules::default(), p)
         };
         // FIFO drains oldest @2000; LIFO newest @1000; HIFO highest-cost @3000.
-        assert_eq!(run(MatchPolicy::Fifo).short.realized_ticks, 100 * (5000 - 2000));
-        assert_eq!(run(MatchPolicy::Lifo).short.realized_ticks, 100 * (5000 - 1000));
-        assert_eq!(run(MatchPolicy::Hifo).short.realized_ticks, 100 * (5000 - 3000));
+        assert_eq!(run(MatchPolicy::Fifo).short().realized_ticks, 100 * (5000 - 2000));
+        assert_eq!(run(MatchPolicy::Lifo).short().realized_ticks, 100 * (5000 - 1000));
+        assert_eq!(run(MatchPolicy::Hifo).short().realized_ticks, 100 * (5000 - 3000));
         // same matched quantity regardless of policy
-        assert_eq!(run(MatchPolicy::Lifo).short.matched_qty, 100);
+        assert_eq!(run(MatchPolicy::Lifo).short().matched_qty, 100);
     }
 
     #[test]
@@ -353,12 +429,12 @@ mod tests {
             rec(-10, 2600, 700),
         ];
         let pnl = fold_partition(7, 3, &recs, &mut NoopSink);
-        assert_eq!(pnl.intraday.realized_ticks, 60 * 200); // 12000
-        assert_eq!(pnl.intraday.matched_qty, 60);
-        assert_eq!(pnl.short.realized_ticks, 40 * 400); // 16000
-        assert_eq!(pnl.short.matched_qty, 40);
-        assert_eq!(pnl.long.realized_ticks, 10 * 600); // 6000
-        assert_eq!(pnl.long.matched_qty, 10);
+        assert_eq!(pnl.intraday().realized_ticks, 60 * 200); // 12000
+        assert_eq!(pnl.intraday().matched_qty, 60);
+        assert_eq!(pnl.short().realized_ticks, 40 * 400); // 16000
+        assert_eq!(pnl.short().matched_qty, 40);
+        assert_eq!(pnl.long().realized_ticks, 10 * 600); // 6000
+        assert_eq!(pnl.long().matched_qty, 10);
     }
 
     #[test]
@@ -372,8 +448,8 @@ mod tests {
         let pnl = fold_partition(1, 1, &recs, &mut NoopSink);
         // span 1-2 days → short bucket
         let expect = 100 * (3000 - 1000) + 50 * (3000 - 2000);
-        assert_eq!(pnl.short.realized_ticks, expect as i128);
-        assert_eq!(pnl.short.matched_qty, 150);
+        assert_eq!(pnl.short().realized_ticks, expect as i128);
+        assert_eq!(pnl.short().matched_qty, 150);
     }
 
     #[test]

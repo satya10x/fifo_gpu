@@ -58,8 +58,11 @@ instead of a fixed 3.
   `classify`, threaded through the fold; default reproduces today's results.
   3 named buckets retained; **threshold configurable** (the jurisdiction lever).
   GPU unchanged (honors the default threshold only — see A.3).
-- **A.2:** generalize `PartitionPnl` to `[BucketPnl; MAX_BUCKETS]` (fixed array,
-  stays `Copy`); `classify` returns an index; arbitrary K-band rules on CPU.
+- **A.2 (done):** `PartitionPnl` (and rollup's `PeriodBuckets`) are now
+  `[BucketPnl; MAX_BUCKETS]` (fixed array, stays `Copy`); `classify` returns an
+  index; `BucketRules` takes arbitrary ascending holding-day bands
+  (`BucketRules::bands`); exposed as `fifo query --bands 30,365`. CPU honors any
+  K-band ruleset; the GPU still emits the 3 default buckets (A.3).
 - **A.3:** thread thresholds + K into the GPU kernels (param array; K-way
   segmented-reduce) so the GPU honors custom rulesets too.
 

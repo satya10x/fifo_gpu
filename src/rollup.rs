@@ -8,7 +8,7 @@
 //! cross-client range queries route here instead of the live engine.
 
 use crate::calendar::civil_from_days;
-use crate::fifo::{BucketPnl, Bucket, Fragment, FragmentSink};
+use crate::fifo::{BucketPnl, Fragment, FragmentSink, MAX_BUCKETS};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -25,25 +25,36 @@ pub fn period_label(period: i32) -> String {
     format!("{y:04}-{m:02}")
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PeriodBuckets {
-    pub intraday: BucketPnl,
-    pub short: BucketPnl,
-    pub long: BucketPnl,
+    pub buckets: [BucketPnl; MAX_BUCKETS],
+}
+
+impl Default for PeriodBuckets {
+    fn default() -> Self {
+        PeriodBuckets { buckets: [BucketPnl::default(); MAX_BUCKETS] }
+    }
 }
 
 impl PeriodBuckets {
-    fn bucket_mut(&mut self, b: Bucket) -> &mut BucketPnl {
-        match b {
-            Bucket::Intraday => &mut self.intraday,
-            Bucket::Short => &mut self.short,
-            Bucket::Long => &mut self.long,
-        }
+    #[inline]
+    fn bucket_mut(&mut self, i: usize) -> &mut BucketPnl {
+        &mut self.buckets[i]
     }
     pub fn merge(&mut self, o: &PeriodBuckets) {
-        self.intraday.merge(&o.intraday);
-        self.short.merge(&o.short);
-        self.long.merge(&o.long);
+        for i in 0..MAX_BUCKETS {
+            self.buckets[i].merge(&o.buckets[i]);
+        }
+    }
+    // Convenience accessors for the default ruleset (intraday/short/long = 0/1/2).
+    pub fn intraday(&self) -> &BucketPnl {
+        &self.buckets[0]
+    }
+    pub fn short(&self) -> &BucketPnl {
+        &self.buckets[1]
+    }
+    pub fn long(&self) -> &BucketPnl {
+        &self.buckets[2]
     }
 }
 
@@ -110,11 +121,11 @@ mod tests {
         fold_partition(1, 1, &recs, &mut roll);
         let jan = period_of(d_jan);
         let feb = period_of(d_feb);
-        assert_eq!(roll.by_period[&jan].intraday.realized_ticks, 100 * 200);
-        assert_eq!(roll.by_period[&feb].short.realized_ticks, 50 * 500);
+        assert_eq!(roll.by_period[&jan].intraday().realized_ticks, 100 * 200);
+        assert_eq!(roll.by_period[&feb].short().realized_ticks, 50 * 500);
         // aggregate over both months
         let agg = roll.aggregate(jan, feb);
-        assert_eq!(agg.intraday.realized_ticks, 100 * 200);
-        assert_eq!(agg.short.realized_ticks, 50 * 500);
+        assert_eq!(agg.intraday().realized_ticks, 100 * 200);
+        assert_eq!(agg.short().realized_ticks, 50 * 500);
     }
 }
