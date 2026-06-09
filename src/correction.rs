@@ -84,7 +84,10 @@ pub fn verify_against_packed(
 ) -> Result<(PartitionPnl, PartitionPnl)> {
     let (regen, _, _) = recompute_client(cfg, client_id);
     let q = Query { clients: ClientSel::One(client_id), symbol: None, span: Span::Full };
-    let packed = query::run_cpu(table, None, &q, &mut NoopSink, &crate::fifo::BucketRules::default())?.pnl;
+    let packed = query::run_cpu(
+        table, None, &q, &mut NoopSink,
+        &crate::fifo::BucketRules::default(), crate::fifo::MatchPolicy::Fifo,
+    )?.pnl;
     Ok((regen, packed))
 }
 

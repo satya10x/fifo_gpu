@@ -46,6 +46,40 @@ impl Default for BucketRules {
     }
 }
 
+/// Lot-matching policy (Axis 2 of the generic engine — see DESIGN.md): which
+/// open buy lot a sell consumes. The carry is kept in time order; the policy
+/// only changes *selection*, so the same fold serves all of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MatchPolicy {
+    /// Oldest open lot first (queue front). The classic, and the only policy the
+    /// GPU scan kernel implements.
+    #[default]
+    Fifo,
+    /// Newest open lot first (queue back).
+    Lifo,
+    /// Highest-cost lot first (tax-loss harvesting). O(n) lot selection here —
+    /// fine as a correctness reference; a price-max heap is the optimization.
+    Hifo,
+}
+
+/// Index of the open lot a sell drains next under `policy`. `carry` is non-empty.
+#[inline]
+fn pick_lot(carry: &VecDeque<Lot>, policy: MatchPolicy) -> usize {
+    match policy {
+        MatchPolicy::Fifo => 0,
+        MatchPolicy::Lifo => carry.len() - 1,
+        MatchPolicy::Hifo => {
+            let mut best = 0;
+            for i in 1..carry.len() {
+                if carry[i].price_ticks > carry[best].price_ticks {
+                    best = i;
+                }
+            }
+            best
+        }
+    }
+}
+
 #[inline]
 pub fn classify(rules: &BucketRules, buy_day: i32, sell_day: i32) -> Bucket {
     if rules.intraday_same_day && buy_day == sell_day {
@@ -163,6 +197,7 @@ pub fn fold_core<S: FragmentSink>(
     sink: &mut S,
     count: Option<(i32, i32)>,
     rules: &BucketRules,
+    policy: MatchPolicy,
 ) -> PartitionPnl {
     let mut pnl = PartitionPnl::default();
     for r in recs {
@@ -181,30 +216,37 @@ pub fn fold_core<S: FragmentSink>(
                 None => true,
             };
             while remaining > 0 {
-                let Some(front) = carry.front_mut() else {
+                if carry.is_empty() {
                     // No open lot to match (generator never shorts; defensive).
                     break;
+                }
+                let idx = pick_lot(carry, policy);
+                // mutate the chosen lot in a scoped borrow, copying what the
+                // fragment needs, so we can `carry.remove(idx)` after.
+                let (matched, buy_day, buy_ticks, drained) = {
+                    let lot = &mut carry[idx];
+                    let matched = remaining.min(lot.qty);
+                    lot.qty -= matched;
+                    (matched, lot.day, lot.price_ticks, lot.qty == 0)
                 };
-                let matched = remaining.min(front.qty);
                 if counted {
-                    let bucket = classify(rules, front.day, sell_day);
+                    let bucket = classify(rules, buy_day, sell_day);
                     let frag = Fragment {
                         client,
                         symbol,
-                        buy_day: front.day,
+                        buy_day,
                         sell_day,
                         matched_qty: matched,
-                        buy_ticks: front.price_ticks,
+                        buy_ticks,
                         sell_ticks,
                         bucket,
                     };
                     pnl.bucket_mut(bucket).add_frag(frag.realized_ticks(), matched);
                     sink.emit(&frag);
                 }
-                front.qty -= matched;
                 remaining -= matched;
-                if front.qty == 0 {
-                    carry.pop_front();
+                if drained {
+                    carry.remove(idx);
                 }
             }
         }
@@ -223,7 +265,7 @@ pub fn fold_with_carry<S: FragmentSink>(
     recs: &[PackedTrade],
     sink: &mut S,
 ) -> PartitionPnl {
-    fold_core(client, symbol, carry, recs, sink, None, &BucketRules::default())
+    fold_core(client, symbol, carry, recs, sink, None, &BucketRules::default(), MatchPolicy::Fifo)
 }
 
 /// Fold a partition from a flat (no carry-in) state.
@@ -264,7 +306,7 @@ mod tests {
         let recs = [rec(100, 1000, 0), rec(-100, 1200, 200)];
         // default (≤365 → short): 200 days is short-term
         let mut c1 = VecDeque::new();
-        let d = fold_core(1, 1, &mut c1, &recs, &mut NoopSink, None, &BucketRules::default());
+        let d = fold_core(1, 1, &mut c1, &recs, &mut NoopSink, None, &BucketRules::default(), MatchPolicy::Fifo);
         assert_eq!(d.short.matched_qty, 100);
         assert_eq!(d.long.matched_qty, 0);
         // stricter jurisdiction (≤100 → short): the same trade is now long-term
@@ -272,10 +314,31 @@ mod tests {
         let s = fold_core(
             1, 1, &mut c2, &recs, &mut NoopSink, None,
             &BucketRules { intraday_same_day: true, short_max_days: 100 },
+            MatchPolicy::Fifo,
         );
         assert_eq!(s.short.matched_qty, 0);
         assert_eq!(s.long.matched_qty, 100);
-        assert_eq!(s.long.realized_ticks, 100 * (1200 - 1000)); // PnL identical, bucket differs
+    }
+
+    #[test]
+    fn match_policy_picks_different_lots() {
+        // three open buys at distinct prices, then one sell of 100 @5000
+        let recs = [
+            rec(100, 2000, 1), // oldest
+            rec(100, 3000, 2), // highest cost
+            rec(100, 1000, 3), // newest
+            rec(-100, 5000, 4),
+        ];
+        let run = |p| {
+            let mut c = VecDeque::new();
+            fold_core(1, 1, &mut c, &recs, &mut NoopSink, None, &BucketRules::default(), p)
+        };
+        // FIFO drains oldest @2000; LIFO newest @1000; HIFO highest-cost @3000.
+        assert_eq!(run(MatchPolicy::Fifo).short.realized_ticks, 100 * (5000 - 2000));
+        assert_eq!(run(MatchPolicy::Lifo).short.realized_ticks, 100 * (5000 - 1000));
+        assert_eq!(run(MatchPolicy::Hifo).short.realized_ticks, 100 * (5000 - 3000));
+        // same matched quantity regardless of policy
+        assert_eq!(run(MatchPolicy::Lifo).short.matched_qty, 100);
     }
 
     #[test]

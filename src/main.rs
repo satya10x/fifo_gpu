@@ -99,6 +99,11 @@ struct QueryArgs {
     /// always its own bucket. See DESIGN.md (Axis 1).
     #[arg(long, default_value_t = fifo_gpu::fifo::LONG_TERM_DAYS)]
     ltcg_days: i32,
+    /// Lot-matching policy: `fifo` | `lifo` | `hifo`. See DESIGN.md (Axis 2).
+    /// Non-FIFO is CPU-only and (for range queries) needs policy-matched
+    /// checkpoints; full-history is fine on any policy.
+    #[arg(long, default_value = "fifo")]
+    policy: String,
 }
 
 #[derive(Parser)]
@@ -277,8 +282,15 @@ fn main() -> Result<()> {
                 intraday_same_day: true,
                 short_max_days: args.ltcg_days,
             };
+            use fifo_gpu::fifo::MatchPolicy;
+            let policy = match args.policy.as_str() {
+                "fifo" => MatchPolicy::Fifo,
+                "lifo" => MatchPolicy::Lifo,
+                "hifo" => MatchPolicy::Hifo,
+                other => anyhow::bail!("unknown --policy {other:?} (expected fifo|lifo|hifo)"),
+            };
             let t0 = std::time::Instant::now();
-            let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink, &rules)?;
+            let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink, &rules, policy)?;
             let dt = t0.elapsed();
             println!(
                 "Query: {:?} symbol={:?} span={:?}",

@@ -11,7 +11,7 @@
 //! Checkpoints are also the seam for whale segmenting (split a huge partition at
 //! cutoffs with carried state) and are versioned by cutoff day on disk.
 
-use crate::fifo::{fold_core, BucketRules, Lot, NoopSink};
+use crate::fifo::{MatchPolicy, fold_core, BucketRules, Lot, NoopSink};
 use crate::packed::PackedTable;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ impl Checkpoint {
                 continue;
             }
             let mut carry: VecDeque<Lot> = VecDeque::new();
-            fold_core(pc[p], ps[p], &mut carry, in_scope, &mut NoopSink, None, &BucketRules::default());
+            fold_core(pc[p], ps[p], &mut carry, in_scope, &mut NoopSink, None, &BucketRules::default(), MatchPolicy::Fifo);
             if !carry.is_empty() {
                 lots.insert(part_key(pc[p], ps[p]), carry.into_iter().collect());
             }
@@ -157,7 +157,7 @@ impl CheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fifo::{fold_partition, NoopSink};
+    use crate::fifo::{MatchPolicy, fold_partition, NoopSink};
     use crate::packed::{PackedBuilder, PackedTrade};
 
     fn rec(sq: i32, px: i32, day: i32) -> PackedTrade {
@@ -184,7 +184,7 @@ mod tests {
         let truth = {
             // fold whole thing but only count sells in [150,250]
             let mut carry = VecDeque::new();
-            fold_core(1, 1, &mut carry, &recs, &mut NoopSink, Some((150, 250)), &BucketRules::default())
+            fold_core(1, 1, &mut carry, &recs, &mut NoopSink, Some((150, 250)), &BucketRules::default(), MatchPolicy::Fifo)
         };
 
         // Via checkpoint at cutoff 100 (state after d10,d20 buys), replay (100, 250].
@@ -192,7 +192,7 @@ mod tests {
         let mut carry = ckpt.carry_for(1, 1);
         let part = t.partition(0);
         let replay = t.day_range(part, 101, 250);
-        let got = fold_core(1, 1, &mut carry, replay, &mut NoopSink, Some((150, 250)), &BucketRules::default());
+        let got = fold_core(1, 1, &mut carry, replay, &mut NoopSink, Some((150, 250)), &BucketRules::default(), MatchPolicy::Fifo);
 
         assert_eq!(got, truth);
         assert_eq!(got.short.matched_qty, 150); // the d200 sell crossed both lots

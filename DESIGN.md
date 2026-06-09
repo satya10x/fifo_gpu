@@ -89,8 +89,11 @@ selection differs. Trivial.
   kernel** (already built, general, less parallel within a partition).
 - The router picks the fast path when the policy allows it.
 
-**Phasing:** B.1 — CPU `MatchPolicy` trait + FIFO/LIFO/HIFO. B.2 — GPU sequential
-kernel generalized to policy; FIFO stays on the scan kernel.
+**Phasing:** **B.1 (done)** — CPU `MatchPolicy{Fifo,Lifo,Hifo}` in `fold_core`,
+exposed as `fifo query --policy …`; FIFO is the default and the only GPU policy.
+(HIFO uses O(n) lot selection — a price-max heap is the optimization; non-FIFO
+range queries need policy-matched checkpoints.) B.2 — GPU sequential kernel
+generalized to policy; FIFO stays on the scan kernel.
 
 ---
 

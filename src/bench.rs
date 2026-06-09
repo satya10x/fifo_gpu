@@ -12,7 +12,7 @@
 use crate::baseline::baseline_query;
 use crate::checkpoint::CheckpointStore;
 use crate::config::GenConfig;
-use crate::fifo::{BucketRules, NoopSink, PartitionPnl};
+use crate::fifo::{MatchPolicy, BucketRules, NoopSink, PartitionPnl};
 use crate::manifest::Manifest;
 use crate::packed::PackedTable;
 use crate::query::{run_cpu, ClientSel, Query, Span};
@@ -133,9 +133,11 @@ pub fn run_bench(
     let table = PackedTable::open(packed_path)?;
     let td = cfg.trading_days();
     let n = td.len();
-    // Default bucket ruleset (intraday / short ≤365d / long). The GPU arm honors
-    // the default threshold, so the bench keeps default to stay GPU-comparable.
+    // Default bucket ruleset (intraday / short ≤365d / long) + FIFO. The GPU arm
+    // implements FIFO with the default threshold, so the bench keeps both default
+    // to stay GPU-comparable; LIFO/HIFO and custom thresholds are CPU-only.
     let rules = BucketRules::default();
+    let policy = MatchPolicy::Fifo;
 
     // --- checkpoints: quarterly cutoffs so range queries get carry-in ---
     let store = CheckpointStore::new(ckpt_dir);
@@ -167,14 +169,14 @@ pub fn run_bench(
     // ---- phase 1: measure every query (CPU, baseline, and GPU where applicable) ----
     let mut qrecs: Vec<QRec> = Vec::new();
     for (name, q) in &queries {
-        let (cpu_res, cpu_ms) = timed(|| run_cpu(&table, Some(&store), q, &mut NoopSink, &rules).unwrap());
+        let (cpu_res, cpu_ms) = timed(|| run_cpu(&table, Some(&store), q, &mut NoopSink, &rules, policy).unwrap());
         let ((base_pnl, _base_rows), base_ms) = timed(|| baseline_query(tradebook_dir, q).unwrap());
         let matches = cpu_res.pnl == base_pnl;
 
         // Diagnostic for range queries: fold the same packed data from scratch
         // (no checkpoint). Splits a mismatch into checkpoint-carry vs packed-data.
         let nockpt_pnl = match q.span {
-            Span::Range(..) => Some(run_cpu(&table, None, q, &mut NoopSink, &rules)?.pnl),
+            Span::Range(..) => Some(run_cpu(&table, None, q, &mut NoopSink, &rules, policy)?.pnl),
             Span::Full => None,
         };
 
