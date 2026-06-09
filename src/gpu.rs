@@ -616,8 +616,11 @@ impl GpuEngine {
         out_real: &mut [[f64; 3]],
         out_qty: &mut [[i64; 3]],
     ) -> Result<()> {
-        let mut hr = vec![0f64; parts * 3];
-        let mut hq = vec![0i64; parts * 3];
+        // dtoh_sync_copy_into requires src.len() == dst.len(), so size the host
+        // buffers to the (max_parts-sized) device slices and read only this
+        // chunk's first `parts` entries.
+        let mut hr = vec![0f64; d_real[slot].len()];
+        let mut hq = vec![0i64; d_qty[slot].len()];
         self.dev.dtoh_sync_copy_into(&d_real[slot], &mut hr)?;
         self.dev.dtoh_sync_copy_into(&d_qty[slot], &mut hq)?;
         for k in 0..parts {
