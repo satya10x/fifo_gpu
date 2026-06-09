@@ -443,7 +443,6 @@ impl GpuEngine {
         let records = table.records();
         let offsets = table.part_offset();
         let n_parts = offsets.len() - 1;
-        let n_rows = records.len();
         if n_parts == 0 {
             return Ok((PartitionPnl::default(), 0.0, false));
         }
@@ -468,17 +467,25 @@ impl GpuEngine {
             .max(1);
         let max_parts = chunks.iter().map(|&(a, b)| b - a).max().unwrap().max(1);
 
-        // 2. page-lock the host records buffer (best effort → async overlap)
-        let host_ptr = records.as_ptr() as *mut std::ffi::c_void;
-        let bytes = n_rows * std::mem::size_of::<PackedTrade>();
-        let pinned =
-            unsafe { sys::lib().cuMemHostRegister_v2(host_ptr, bytes, 0) } == sys::CUresult::CUDA_SUCCESS;
+        // 2. pinned host staging (one per slot). Async H2D overlaps the previous
+        // chunk's kernel only from page-locked memory; cuMemHostRegister on the
+        // read-only file-backed mmap fails, so allocate writable pinned staging
+        // via cuMemAllocHost and copy each chunk in. Pinning also lifts effective
+        // H2D bandwidth (pageable ~4 GB/s → pinned ~PCIe peak).
+        let rec_sz = std::mem::size_of::<PackedTrade>();
+        let stage_bytes = max_rows * rec_sz;
+        let mut staging: [*mut std::ffi::c_void; 2] = [std::ptr::null_mut(); 2];
+        let mut pinned = true;
+        for i in 0..2 {
+            let ok = unsafe { sys::lib().cuMemAllocHost_v2(&mut staging[i] as *mut _, stage_bytes) }
+                == sys::CUresult::CUDA_SUCCESS;
+            pinned &= ok;
+        }
 
         // 3. two streams + two device buffer slots (double buffering)
         let streams = [self.dev.fork_default_stream()?, self.dev.fork_default_stream()?];
         // records as raw bytes (the kernel reinterprets as Rec*) — avoids needing
         // DeviceRepr for PackedTrade, matching the serial fold_buffers path.
-        let rec_sz = std::mem::size_of::<PackedTrade>();
         let mut d_recs: Vec<CudaSlice<u8>> = Vec::new();
         let mut d_off: Vec<CudaSlice<u64>> = Vec::new();
         let mut d_bigp: Vec<CudaSlice<u32>> = Vec::new();
@@ -531,7 +538,20 @@ impl GpuEngine {
                 // async H2D: records from the pinned host buffer (this overlaps);
                 // the tiny offset/index arrays are pageable (effectively sync).
                 let rec_bytes: &[u8] = bytemuck::cast_slice(&records[r0..r1]);
-                result::memcpy_htod_async(*d_recs[slot].device_ptr(), rec_bytes, st)?;
+                if pinned {
+                    // copy chunk into pinned staging, then async H2D from it (the
+                    // slot is free to overwrite — we synchronize before reuse)
+                    std::ptr::copy_nonoverlapping(
+                        rec_bytes.as_ptr(),
+                        staging[slot] as *mut u8,
+                        rec_bytes.len(),
+                    );
+                    let staged =
+                        std::slice::from_raw_parts(staging[slot] as *const u8, rec_bytes.len());
+                    result::memcpy_htod_async(*d_recs[slot].device_ptr(), staged, st)?;
+                } else {
+                    result::memcpy_htod_async(*d_recs[slot].device_ptr(), rec_bytes, st)?;
+                }
                 result::memcpy_htod_async(*d_off[slot].device_ptr(), &off_local, st)?;
                 if nbig > 0 {
                     result::memcpy_htod_async(*d_bigp[slot].device_ptr(), &big_local, st)?;
@@ -595,9 +615,11 @@ impl GpuEngine {
         }
         let total_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-        if pinned {
-            unsafe {
-                let _ = sys::lib().cuMemHostUnregister(host_ptr);
+        for &s in staging.iter() {
+            if !s.is_null() {
+                unsafe {
+                    let _ = sys::lib().cuMemFreeHost(s);
+                }
             }
         }
         Ok((sum_pnl(&out_real, &out_qty), total_ms, pinned))
