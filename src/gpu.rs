@@ -33,7 +33,9 @@
 use crate::fifo::{BucketPnl, PartitionPnl};
 use crate::packed::PackedTable;
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{
+    result, sys, CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig,
+};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::Arc;
 
@@ -45,6 +47,11 @@ pub const BIG_PARTITION_THRESHOLD: u64 = 1 << 15; // 32768
 /// Threads per block for `fifo_kernel_big`. Static shared scratch is sized for
 /// up to 1024 so this can be tuned up without touching the kernel.
 const BIG_BLOCK: u32 = 256;
+
+/// Target rows per chunk for the streamed fold (~4M ≈ 128 MiB of records). Sets
+/// the H2D/kernel overlap granularity and bounds VRAM to ~2 chunks regardless of
+/// total table size.
+const STREAM_CHUNK_ROWS: u64 = 4_000_000;
 
 const KERNEL: &str = r#"
 extern "C" {
@@ -420,6 +427,200 @@ impl GpuEngine {
     pub fn fold_total(&self, table: &PackedTable) -> Result<(PartitionPnl, GpuTiming)> {
         let (realized, qty, timing) = self.fold_all(table)?;
         Ok((sum_pnl(&realized, &qty), timing))
+    }
+
+    /// Streamed whole-table fold (Decision 5): process the table in
+    /// partition-chunks across **two CUDA streams** with the host records buffer
+    /// **page-locked** (`cuMemHostRegister`), so each chunk's H2D overlaps the
+    /// previous chunk's kernel. VRAM is bounded to ~2 chunks regardless of table
+    /// size, which removes the single-shot OOM ceiling.
+    ///
+    /// Returns the totals, end-to-end wall time (ms), and whether page-locking
+    /// succeeded (if not, copies still run correctly but won't overlap).
+    pub fn fold_total_streamed(&self, table: &PackedTable) -> Result<(PartitionPnl, f64, bool)> {
+        use crate::packed::PackedTrade;
+
+        let records = table.records();
+        let offsets = table.part_offset();
+        let n_parts = offsets.len() - 1;
+        let n_rows = records.len();
+        if n_parts == 0 {
+            return Ok((PartitionPnl::default(), 0.0, false));
+        }
+        let big_threshold = BIG_PARTITION_THRESHOLD;
+
+        // 1. plan contiguous partition-chunks bounded by STREAM_CHUNK_ROWS
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        let mut p0 = 0usize;
+        while p0 < n_parts {
+            let mut p1 = p0 + 1;
+            while p1 < n_parts && (offsets[p1 + 1] - offsets[p0]) <= STREAM_CHUNK_ROWS {
+                p1 += 1;
+            }
+            chunks.push((p0, p1));
+            p0 = p1;
+        }
+        let max_rows = chunks
+            .iter()
+            .map(|&(a, b)| (offsets[b] - offsets[a]) as usize)
+            .max()
+            .unwrap()
+            .max(1);
+        let max_parts = chunks.iter().map(|&(a, b)| b - a).max().unwrap().max(1);
+
+        // 2. page-lock the host records buffer (best effort → async overlap)
+        let host_ptr = records.as_ptr() as *mut std::ffi::c_void;
+        let bytes = n_rows * std::mem::size_of::<PackedTrade>();
+        let pinned =
+            unsafe { sys::lib().cuMemHostRegister_v2(host_ptr, bytes, 0) } == sys::CUresult::CUDA_SUCCESS;
+
+        // 3. two streams + two device buffer slots (double buffering)
+        let streams = [self.dev.fork_default_stream()?, self.dev.fork_default_stream()?];
+        let mut d_recs: Vec<CudaSlice<PackedTrade>> = Vec::new();
+        let mut d_off: Vec<CudaSlice<u64>> = Vec::new();
+        let mut d_bigp: Vec<CudaSlice<u32>> = Vec::new();
+        let mut d_cum: Vec<CudaSlice<i64>> = Vec::new();
+        let mut d_price: Vec<CudaSlice<i64>> = Vec::new();
+        let mut d_day: Vec<CudaSlice<i32>> = Vec::new();
+        let mut d_lots: Vec<CudaSlice<u8>> = Vec::new();
+        let mut d_real: Vec<CudaSlice<f64>> = Vec::new();
+        let mut d_qty: Vec<CudaSlice<i64>> = Vec::new();
+        for _ in 0..2 {
+            unsafe {
+                d_recs.push(self.dev.alloc::<PackedTrade>(max_rows)?);
+                d_off.push(self.dev.alloc::<u64>(max_parts + 1)?);
+                d_bigp.push(self.dev.alloc::<u32>(max_parts)?);
+                d_cum.push(self.dev.alloc::<i64>(max_rows)?);
+                d_price.push(self.dev.alloc::<i64>(max_rows)?);
+                d_day.push(self.dev.alloc::<i32>(max_rows)?);
+                d_lots.push(self.dev.alloc::<u8>(max_rows * 24)?);
+                d_real.push(self.dev.alloc::<f64>(max_parts * 3)?);
+                d_qty.push(self.dev.alloc::<i64>(max_parts * 3)?);
+            }
+        }
+
+        let mut out_real = vec![[0f64; 3]; n_parts];
+        let mut out_qty = vec![[0i64; 3]; n_parts];
+        let mut pending: [Option<(usize, usize)>; 2] = [None, None]; // (chunk p0, n_parts)
+
+        let t0 = std::time::Instant::now();
+        for (i, &(cp0, cp1)) in chunks.iter().enumerate() {
+            let slot = i % 2;
+
+            // harvest the chunk currently occupying this slot before overwriting
+            if let Some((pp0, pparts)) = pending[slot].take() {
+                unsafe { result::stream::synchronize(streams[slot].stream)? };
+                self.harvest(slot, pp0, pparts, &d_real, &d_qty, &mut out_real, &mut out_qty)?;
+            }
+
+            let r0 = offsets[cp0] as usize;
+            let r1 = offsets[cp1] as usize;
+            let parts = cp1 - cp0;
+            // chunk-local offsets + big-partition indices
+            let off_local: Vec<u64> = (cp0..=cp1).map(|p| offsets[p] - offsets[cp0]).collect();
+            let big_local: Vec<u32> = (0..parts as u32)
+                .filter(|&k| off_local[k as usize + 1] - off_local[k as usize] >= big_threshold)
+                .collect();
+            let nbig = big_local.len();
+
+            let st = streams[slot].stream;
+            unsafe {
+                // async H2D: records from the pinned host buffer (this overlaps);
+                // the tiny offset/index arrays are pageable (effectively sync).
+                result::memcpy_htod_async(*d_recs[slot].device_ptr(), &records[r0..r1], st)?;
+                result::memcpy_htod_async(*d_off[slot].device_ptr(), &off_local, st)?;
+                if nbig > 0 {
+                    result::memcpy_htod_async(*d_bigp[slot].device_ptr(), &big_local, st)?;
+                }
+                // zero this chunk's outputs (big kernel atomic-adds onto them)
+                result::memset_d8_async(*d_real[slot].device_ptr(), 0, parts * 3 * 8, st)?;
+                result::memset_d8_async(*d_qty[slot].device_ptr(), 0, parts * 3 * 8, st)?;
+            }
+
+            let cfg_small = LaunchConfig::for_num_elems(parts as u32);
+            let small = self.dev.get_func("fifo", "fifo_kernel").unwrap();
+            unsafe {
+                small.launch_on_stream(
+                    &streams[slot],
+                    cfg_small,
+                    (
+                        &d_recs[slot],
+                        &d_off[slot],
+                        parts as i32,
+                        big_threshold,
+                        &d_lots[slot],
+                        &mut d_real[slot],
+                        &mut d_qty[slot],
+                    ),
+                )?;
+            }
+            if nbig > 0 {
+                let cfg_big = LaunchConfig {
+                    grid_dim: (nbig as u32, 1, 1),
+                    block_dim: (BIG_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let big = self.dev.get_func("fifo", "fifo_kernel_big").unwrap();
+                unsafe {
+                    big.launch_on_stream(
+                        &streams[slot],
+                        cfg_big,
+                        (
+                            &d_recs[slot],
+                            &d_off[slot],
+                            &d_bigp[slot],
+                            nbig as i32,
+                            &mut d_cum[slot],
+                            &mut d_price[slot],
+                            &mut d_day[slot],
+                            &mut d_real[slot],
+                            &mut d_qty[slot],
+                        ),
+                    )?;
+                }
+            }
+            pending[slot] = Some((cp0, parts));
+        }
+
+        // drain the last (≤2) in-flight chunks
+        for slot in 0..2 {
+            if let Some((pp0, pparts)) = pending[slot].take() {
+                unsafe { result::stream::synchronize(streams[slot].stream)? };
+                self.harvest(slot, pp0, pparts, &d_real, &d_qty, &mut out_real, &mut out_qty)?;
+            }
+        }
+        let total_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        if pinned {
+            unsafe {
+                let _ = sys::lib().cuMemHostUnregister(host_ptr);
+            }
+        }
+        Ok((sum_pnl(&out_real, &out_qty), total_ms, pinned))
+    }
+
+    /// Copy one chunk's per-partition results (device → host) into the global
+    /// accumulators at the chunk's base partition index.
+    #[allow(clippy::too_many_arguments)]
+    fn harvest(
+        &self,
+        slot: usize,
+        cp0: usize,
+        parts: usize,
+        d_real: &[CudaSlice<f64>],
+        d_qty: &[CudaSlice<i64>],
+        out_real: &mut [[f64; 3]],
+        out_qty: &mut [[i64; 3]],
+    ) -> Result<()> {
+        let mut hr = vec![0f64; parts * 3];
+        let mut hq = vec![0i64; parts * 3];
+        self.dev.dtoh_sync_copy_into(&d_real[slot], &mut hr)?;
+        self.dev.dtoh_sync_copy_into(&d_qty[slot], &mut hq)?;
+        for k in 0..parts {
+            out_real[cp0 + k] = [hr[k * 3], hr[k * 3 + 1], hr[k * 3 + 2]];
+            out_qty[cp0 + k] = [hq[k * 3], hq[k * 3 + 1], hq[k * 3 + 2]];
+        }
+        Ok(())
     }
 }
 

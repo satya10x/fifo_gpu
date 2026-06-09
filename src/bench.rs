@@ -361,6 +361,29 @@ fn run_gpu_arm(table: &PackedTable) -> Result<()> {
         if pnl_ok { "within 1e-6 ✓" } else { "DIVERGES ✗" }
     );
     println!("  {}", fmt_pnl(&gpu_pnl));
+
+    // Streamed arm (Decision 5): chunked + 2 streams + pinned host → H2D/kernel
+    // overlap and bounded VRAM. Compare its end-to-end total to the serial total.
+    println!("\n── GPU streamed arm (2 streams + pinned, H2D/kernel overlap) ──");
+    let (s_pnl, s_ms, pinned) = eng.fold_total_streamed(table)?;
+    let s_qmatch = s_pnl.intraday.matched_qty == cpu_pnl.intraday.matched_qty
+        && s_pnl.short.matched_qty == cpu_pnl.short.matched_qty
+        && s_pnl.long.matched_qty == cpu_pnl.long.matched_qty;
+    let s_pnl_ok = rel(s_pnl.intraday.realized_ticks, cpu_pnl.intraday.realized_ticks) < 1e-6
+        && rel(s_pnl.short.realized_ticks, cpu_pnl.short.realized_ticks) < 1e-6
+        && rel(s_pnl.long.realized_ticks, cpu_pnl.long.realized_ticks) < 1e-6;
+    println!(
+        "  total: {:.1} ms (host pinned: {})  vs serial GPU total {:.1} ms  →  {:.2}× overlap speedup",
+        s_ms,
+        if pinned { "yes" } else { "NO — no overlap" },
+        t.total_ms,
+        if s_ms > 0.0 { t.total_ms / s_ms } else { 0.0 }
+    );
+    println!(
+        "  validation vs CPU oracle: matched_qty {}, realized {}",
+        if s_qmatch { "EXACT ✓" } else { "MISMATCH ✗" },
+        if s_pnl_ok { "within 1e-6 ✓" } else { "DIVERGES ✗" }
+    );
     Ok(())
 }
 
