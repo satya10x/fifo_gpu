@@ -111,10 +111,11 @@ __global__ void fifo_kernel_big(
     const unsigned long long* offsets,
     const unsigned int* big_parts,   // [n_big] partition indices for this launch
     int          n_big,
-    // per-record scratch, indexed from each partition's `start` (buys and sells
-    // live in separate arrays, each <= partition size, so no collision):
-    long long*   buyCum,  long long* buyPrice, int* buyDay,
-    long long*   sellCum, long long* sellPrice, int* sellDay,
+    // per-record scratch, indexed from each partition's `start`. buys and sells
+    // share these arrays: buys occupy [start, start+nb), sells [start+nb, end).
+    // Since nb+ns == partition size, one set of full-width arrays suffices (half
+    // the memory of separate buy/sell arrays).
+    long long*   cum,  long long* price, int* day,
     double*      out_realized,
     long long*   out_qty)
 {
@@ -164,7 +165,10 @@ __global__ void fifo_kernel_big(
     }
     __syncthreads();
 
-    // pass C: re-walk chunk, scatter buys/sells in order + write cumulative axes
+    int tnb = s_total_nb, tns = s_total_ns;
+    unsigned long long sb = start + (unsigned long long)tnb; // sell region base
+
+    // pass C: re-walk chunk, scatter buys to [start..), sells to [sb..) + cum axes
     {
         int bi = s_nb[tid]; int si = s_ns[tid];
         long long bcum = s_bq[tid]; long long scum = s_sq[tid];
@@ -172,22 +176,21 @@ __global__ void fifo_kernel_big(
             long long s = recs[i].signed_qty;
             if (s > 0) {
                 bcum += s;
-                buyCum[start + bi]   = bcum;
-                buyPrice[start + bi] = recs[i].price_ticks;
-                buyDay[start + bi]   = recs[i].day;
+                cum[start + bi]   = bcum;
+                price[start + bi] = recs[i].price_ticks;
+                day[start + bi]   = recs[i].day;
                 bi++;
             } else if (s < 0) {
                 scum += -s;
-                sellCum[start + si]   = scum;
-                sellPrice[start + si] = recs[i].price_ticks;
-                sellDay[start + si]   = recs[i].day;
+                cum[sb + si]   = scum;
+                price[sb + si] = recs[i].price_ticks;
+                day[sb + si]   = recs[i].day;
                 si++;
             }
         }
     }
     __syncthreads();
 
-    int tnb = s_total_nb, tns = s_total_ns;
     if (tnb == 0 || tns == 0) {
         if (tid == 0) {
             out_realized[p*3+0] = 0; out_realized[p*3+1] = 0; out_realized[p*3+2] = 0;
@@ -196,8 +199,8 @@ __global__ void fifo_kernel_big(
         return;
     }
 
-    long long Bt = buyCum[start + tnb - 1];
-    long long St = sellCum[start + tns - 1];
+    long long Bt = cum[start + tnb - 1];
+    long long St = cum[sb + tns - 1];
     long long T  = Bt < St ? Bt : St;     // total matched shares (no shorting => St)
 
     // searchsorted match: each thread takes a stride of sells, finds the buy
@@ -205,30 +208,30 @@ __global__ void fifo_kernel_big(
     double lr0 = 0, lr1 = 0, lr2 = 0;
     unsigned long long lm0 = 0, lm1 = 0, lm2 = 0;
     for (int j = tid; j < tns; j += nt) {
-        long long sLo = (j == 0) ? 0 : sellCum[start + j - 1];
-        long long sHi = sellCum[start + j];
+        long long sLo = (j == 0) ? 0 : cum[sb + j - 1];
+        long long sHi = cum[sb + j];
         if (sLo >= T) continue;
         if (sHi > T) sHi = T;
-        long long sp = sellPrice[start + j];
-        int sd = sellDay[start + j];
+        long long sp = price[sb + j];
+        int sd = day[sb + j];
 
-        // first buy i with buyCum[i] > sLo  (the interval covering position sLo)
+        // first buy i with cum[i] > sLo  (the interval covering position sLo)
         int lo = 0, hi = tnb;
         while (lo < hi) {
             int mid = (lo + hi) >> 1;
-            if (buyCum[start + mid] > sLo) hi = mid; else lo = mid + 1;
+            if (cum[start + mid] > sLo) hi = mid; else lo = mid + 1;
         }
         int i = lo;
         while (i < tnb) {
-            long long bLo = (i == 0) ? 0 : buyCum[start + i - 1];
+            long long bLo = (i == 0) ? 0 : cum[start + i - 1];
             if (bLo >= sHi) break;
-            long long bHi = buyCum[start + i];
+            long long bHi = cum[start + i];
             long long segLo = sLo > bLo ? sLo : bLo;
             long long segHi = sHi < bHi ? sHi : bHi;
             long long q = segHi - segLo;
             if (q > 0) {
-                double pnl = (double)q * (double)(sp - buyPrice[start + i]);
-                int span = sd - buyDay[start + i];
+                double pnl = (double)q * (double)(sp - price[start + i]);
+                int span = sd - day[start + i];
                 if (span == 0)        { lr0 += pnl; lm0 += (unsigned long long)q; }
                 else if (span <= 365) { lr1 += pnl; lm1 += (unsigned long long)q; }
                 else                  { lr2 += pnl; lm2 += (unsigned long long)q; }
@@ -338,15 +341,13 @@ impl GpuEngine {
         let d_lots = self.dev.alloc_zeros::<u8>(n_rows * 24)?; // sizeof(Lot)
         let mut d_realized = self.dev.alloc_zeros::<f64>(n_parts as usize * 3)?;
         let mut d_qty = self.dev.alloc_zeros::<i64>(n_parts as usize * 3)?;
-        // Per-record scratch for the big-partition kernel (buys/sells in separate
-        // arrays, each <= partition size; indexed from each partition's `start`).
+        // Per-record scratch for the big-partition kernel. buys and sells share
+        // these arrays (buys [start..start+nb), sells [start+nb..end)), so one
+        // set of full-width arrays suffices — 20 B/row, not 40.
         let d_big_parts = self.dev.htod_sync_copy(&big_parts)?;
-        let mut d_buy_cum = self.dev.alloc_zeros::<i64>(n_rows.max(1))?;
-        let mut d_buy_price = self.dev.alloc_zeros::<i64>(n_rows.max(1))?;
-        let mut d_buy_day = self.dev.alloc_zeros::<i32>(n_rows.max(1))?;
-        let mut d_sell_cum = self.dev.alloc_zeros::<i64>(n_rows.max(1))?;
-        let mut d_sell_price = self.dev.alloc_zeros::<i64>(n_rows.max(1))?;
-        let mut d_sell_day = self.dev.alloc_zeros::<i32>(n_rows.max(1))?;
+        let mut d_cum = self.dev.alloc_zeros::<i64>(n_rows.max(1))?;
+        let mut d_price = self.dev.alloc_zeros::<i64>(n_rows.max(1))?;
+        let mut d_day = self.dev.alloc_zeros::<i32>(n_rows.max(1))?;
         self.dev.synchronize()?;
         let h2d_ms = t0.elapsed().as_secs_f64() * 1e3;
 
@@ -385,12 +386,9 @@ impl GpuEngine {
                         &d_offsets,
                         &d_big_parts,
                         n_big as i32,
-                        &mut d_buy_cum,
-                        &mut d_buy_price,
-                        &mut d_buy_day,
-                        &mut d_sell_cum,
-                        &mut d_sell_price,
-                        &mut d_sell_day,
+                        &mut d_cum,
+                        &mut d_price,
+                        &mut d_day,
                         &mut d_realized,
                         &mut d_qty,
                     ),
