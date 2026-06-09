@@ -28,6 +28,7 @@ memmap2 = "0.9"
 # `cuda-version-from-build-system` auto-detects the installed CUDA on the GPU box.
 # This dep only builds when the `gpu` feature is on (i.e. on an NVIDIA host).
 cudarc = { version = "0.12", optional = true, default-features = false, features = [
+    "std",
     "nvrtc",
     "driver",
     "cuda-version-from-build-system",
