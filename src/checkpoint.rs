@@ -97,9 +97,35 @@ impl CheckpointStore {
     }
 
     /// Build checkpoints at each cutoff day and persist them.
+    ///
+    /// First clears any existing `ckpt-*.json` in the directory: checkpoints are
+    /// derived from a specific packed dataset, so leftovers from a *prior* dataset
+    /// (e.g. after a regenerate, which shifts the cutoff days) would otherwise
+    /// survive and let [`load_nearest_before`] return carry-in from stale data.
     pub fn build_periodic(&self, table: &PackedTable, cutoffs: &[i32]) -> Result<()> {
+        self.clear()?;
         for &c in cutoffs {
             Checkpoint::build(table, c).write(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// Remove all `ckpt-*.json` checkpoint files in the directory (leaves any
+    /// other files untouched).
+    pub fn clear(&self) -> Result<()> {
+        if !self.dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            let is_ckpt = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("ckpt-") && s.ends_with(".json"))
+                .unwrap_or(false);
+            if is_ckpt {
+                std::fs::remove_file(&path)?;
+            }
         }
         Ok(())
     }
@@ -170,6 +196,31 @@ mod tests {
 
         assert_eq!(got, truth);
         assert_eq!(got.short.matched_qty, 150); // the d200 sell crossed both lots
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn build_periodic_clears_stale_checkpoints() {
+        let recs = [rec(100, 1000, 10), rec(-40, 1500, 20)];
+        let mut b = PackedBuilder::new();
+        b.push_partition(1, 1, &recs);
+        let path = std::env::temp_dir().join("fifo_ckpt_stale.fifopack");
+        b.write(&path).unwrap();
+        let t = PackedTable::open(&path).unwrap();
+
+        let dir = std::env::temp_dir().join("fifo_ckpt_stale_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CheckpointStore::new(&dir);
+
+        // First dataset/cutoffs.
+        store.build_periodic(&t, &[15, 25]).unwrap();
+        assert_eq!(store.cutoffs().unwrap(), vec![15, 25]);
+
+        // A regenerate shifts the cutoffs — the old [15,25] must NOT linger.
+        store.build_periodic(&t, &[30, 40]).unwrap();
+        assert_eq!(store.cutoffs().unwrap(), vec![30, 40]);
+
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&path);
     }
 
