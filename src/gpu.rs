@@ -30,7 +30,7 @@
 //! partition `fifo_kernel` (launch/serial overhead is negligible there); it now
 //! early-returns on big partitions so the two kernels partition the work cleanly.
 
-use crate::fifo::{BucketPnl, PartitionPnl};
+use crate::fifo::{BucketPnl, BucketRules, PartitionPnl};
 use crate::packed::PackedTable;
 use anyhow::{Context, Result};
 use cudarc::driver::{
@@ -56,8 +56,20 @@ const STREAM_CHUNK_ROWS: u64 = 4_000_000;
 const KERNEL: &str = r#"
 extern "C" {
 
+#define MAXB 8   // == MAX_BUCKETS in fifo.rs
+
 struct Rec  { int signed_qty; int price_ticks; int day; };          // 12B, matches PackedTrade
 struct Lot  { long long qty; long long price; int day; int pad; };  // 24B (open-lot scratch)
+
+// Bucket index for a holding span (days) — mirrors the CPU classify(): intraday
+// (span==0) is bucket 0 when `intraday`; then ascending inclusive `bounds` pick
+// the band; past the last bound -> the final bucket.
+__device__ __forceinline__ int bucket_of(int span, int intraday, const int* bounds, int n_bounds) {
+    int base = 0;
+    if (intraday) { if (span == 0) return 0; base = 1; }
+    for (int i = 0; i < n_bounds; i++) { if (span <= bounds[i]) return base + i; }
+    return base + n_bounds;
+}
 
 // ---- small-partition arm: one thread per partition, sequential FIFO drain ----
 __global__ void fifo_kernel(
@@ -65,9 +77,13 @@ __global__ void fifo_kernel(
     const unsigned long long* offsets,
     int          n_parts,
     unsigned long long big_threshold,
+    int          intraday,
+    int          n_bounds,
+    const int*   bounds,
+    int          k,              // number of buckets (<= MAXB)
     Lot*         lots,           // scratch, one slot per record (worst case all-open)
-    double*      out_realized,   // [n_parts*3]  intraday/short/long
-    long long*   out_qty)        // [n_parts*3]
+    double*      out_realized,   // [n_parts*k]
+    long long*   out_qty)        // [n_parts*k]
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_parts) return;
@@ -79,8 +95,8 @@ __global__ void fifo_kernel(
     Lot* q = lots + start;       // capacity (end - start)
     long long head = 0, tail = 0;
 
-    double r0 = 0, r1 = 0, r2 = 0;
-    long long m0 = 0, m1 = 0, m2 = 0;
+    double r[MAXB]; long long m[MAXB];
+    for (int b = 0; b < k; b++) { r[b] = 0; m[b] = 0; }
 
     for (unsigned long long i = start; i < end; i++) {
         long long sq = recs[i].signed_qty;
@@ -91,24 +107,21 @@ __global__ void fifo_kernel(
             tail++;
         } else if (sq < 0) {
             long long rem = -sq;
-            long long sd  = recs[i].day;
+            int sd  = recs[i].day;
             long long sp  = recs[i].price_ticks;
             while (rem > 0 && head < tail) {
                 Lot* L = &q[head];
-                long long m   = rem < L->qty ? rem : L->qty;
-                long long pnl = m * (sp - L->price);
-                long long span = sd - (long long)L->day;
-                if (span == 0)        { r0 += (double)pnl; m0 += m; }
-                else if (span <= 365) { r1 += (double)pnl; m1 += m; }
-                else                  { r2 += (double)pnl; m2 += m; }
-                L->qty -= m;
-                rem    -= m;
+                long long mm  = rem < L->qty ? rem : L->qty;
+                long long pnl = mm * (sp - L->price);
+                int b = bucket_of(sd - L->day, intraday, bounds, n_bounds);
+                r[b] += (double)pnl; m[b] += mm;
+                L->qty -= mm;
+                rem    -= mm;
                 if (L->qty == 0) head++;
             }
         }
     }
-    out_realized[p*3+0] = r0; out_realized[p*3+1] = r1; out_realized[p*3+2] = r2;
-    out_qty[p*3+0] = m0; out_qty[p*3+1] = m1; out_qty[p*3+2] = m2;
+    for (int b = 0; b < k; b++) { out_realized[p*k+b] = r[b]; out_qty[p*k+b] = m[b]; }
 }
 
 // ---- big-partition arm: one block per partition (scan + searchsorted + reduce) ----
@@ -118,6 +131,10 @@ __global__ void fifo_kernel_big(
     const unsigned long long* offsets,
     const unsigned int* big_parts,   // [n_big] partition indices for this launch
     int          n_big,
+    int          intraday,
+    int          n_bounds,
+    const int*   bounds,
+    int          k,
     // per-record scratch, indexed from each partition's `start`. buys and sells
     // share these arrays: buys occupy [start, start+nb), sells [start+nb, end).
     // Since nb+ns == partition size, one set of full-width arrays suffices (half
@@ -200,8 +217,7 @@ __global__ void fifo_kernel_big(
 
     if (tnb == 0 || tns == 0) {
         if (tid == 0) {
-            out_realized[p*3+0] = 0; out_realized[p*3+1] = 0; out_realized[p*3+2] = 0;
-            out_qty[p*3+0] = 0; out_qty[p*3+1] = 0; out_qty[p*3+2] = 0;
+            for (int b = 0; b < k; b++) { out_realized[p*k+b] = 0; out_qty[p*k+b] = 0; }
         }
         return;
     }
@@ -212,8 +228,8 @@ __global__ void fifo_kernel_big(
 
     // searchsorted match: each thread takes a stride of sells, finds the buy
     // interval containing its start via binary search, walks overlaps forward.
-    double lr0 = 0, lr1 = 0, lr2 = 0;
-    unsigned long long lm0 = 0, lm1 = 0, lm2 = 0;
+    double lr[MAXB]; unsigned long long lm[MAXB];
+    for (int b = 0; b < k; b++) { lr[b] = 0; lm[b] = 0; }
     for (int j = tid; j < tns; j += nt) {
         long long sLo = (j == 0) ? 0 : cum[sb + j - 1];
         long long sHi = cum[sb + j];
@@ -238,23 +254,18 @@ __global__ void fifo_kernel_big(
             long long q = segHi - segLo;
             if (q > 0) {
                 double pnl = (double)q * (double)(sp - price[start + i]);
-                int span = sd - day[start + i];
-                if (span == 0)        { lr0 += pnl; lm0 += (unsigned long long)q; }
-                else if (span <= 365) { lr1 += pnl; lm1 += (unsigned long long)q; }
-                else                  { lr2 += pnl; lm2 += (unsigned long long)q; }
+                int b = bucket_of(sd - day[start + i], intraday, bounds, n_bounds);
+                lr[b] += pnl; lm[b] += (unsigned long long)q;
             }
             i++;
         }
     }
 
-    // segmented reduce into the partition's 3 buckets (one block per partition,
-    // so atomics here contend only within this block on 6 addresses).
-    atomicAdd(&out_realized[p*3+0], lr0);
-    atomicAdd(&out_realized[p*3+1], lr1);
-    atomicAdd(&out_realized[p*3+2], lr2);
-    atomicAdd((unsigned long long*)&out_qty[p*3+0], lm0);
-    atomicAdd((unsigned long long*)&out_qty[p*3+1], lm1);
-    atomicAdd((unsigned long long*)&out_qty[p*3+2], lm2);
+    // segmented reduce into the partition's k buckets (one block per partition).
+    for (int b = 0; b < k; b++) {
+        atomicAdd(&out_realized[p*k+b], lr[b]);
+        atomicAdd((unsigned long long*)&out_qty[p*k+b], lm[b]);
+    }
 }
 
 } // extern "C"
@@ -287,24 +298,27 @@ impl GpuEngine {
         Ok(GpuEngine { dev })
     }
 
-    /// Fold every partition on the GPU; returns per-partition (realized[3], qty[3])
-    /// plus a transfer/kernel timing breakdown (Decision 3: transfer ≥ kernel).
+    /// Fold every partition on the GPU; returns flat per-partition `realized`/
+    /// `qty` arrays (`n_parts * k`), the bucket count `k`, and a transfer/kernel
+    /// timing breakdown.
     pub fn fold_all(
         &self,
         table: &PackedTable,
-    ) -> Result<(Vec<[f64; 3]>, Vec<[i64; 3]>, GpuTiming)> {
-        self.fold_buffers(table.records(), table.part_offset())
+        rules: &BucketRules,
+    ) -> Result<(Vec<f64>, Vec<i64>, usize, GpuTiming)> {
+        self.fold_buffers(table.records(), table.part_offset(), rules)
     }
 
     /// Fold an arbitrary set of partitions (full-history, no range carry-in) by
     /// gathering just those partitions' records into a contiguous buffer and
     /// uploading only that — so the H2D cost reflects the *query*, not the whole
-    /// table. This is the per-query GPU arm the router calibrates against. Range
-    /// queries (which need checkpoint carry-in) stay on CPU and aren't folded here.
+    /// table. Honors `rules` (K-way bucketing). Range queries (checkpoint
+    /// carry-in) stay on CPU and aren't folded here.
     pub fn fold_query(
         &self,
         table: &PackedTable,
         parts: &[usize],
+        rules: &BucketRules,
     ) -> Result<(PartitionPnl, GpuTiming)> {
         let total: usize = parts.iter().map(|&p| table.partition(p).len()).sum();
         let mut recs: Vec<crate::packed::PackedTrade> = Vec::with_capacity(total);
@@ -314,21 +328,33 @@ impl GpuEngine {
             recs.extend_from_slice(table.partition(p));
             offsets.push(recs.len() as u64);
         }
-        let (realized, qty, timing) = self.fold_buffers(&recs, &offsets)?;
-        Ok((sum_pnl(&realized, &qty), timing))
+        let (realized, qty, k, timing) = self.fold_buffers(&recs, &offsets, rules)?;
+        Ok((sum_pnl(&realized, &qty, k), timing))
     }
 
     /// Core GPU fold over a contiguous record buffer with prefix `offsets`
-    /// (length `n_parts + 1`, starting at 0). Shared by [`fold_all`] (whole
-    /// table) and [`fold_query`] (a gathered subset).
+    /// (length `n_parts + 1`, starting at 0), bucketed per `rules` (K buckets).
+    /// Returns flat `realized`/`qty` (`n_parts * k`) + `k`. Shared by [`fold_all`]
+    /// and [`fold_query`].
     fn fold_buffers(
         &self,
         records: &[crate::packed::PackedTrade],
         offsets: &[u64],
-    ) -> Result<(Vec<[f64; 3]>, Vec<[i64; 3]>, GpuTiming)> {
+        rules: &BucketRules,
+    ) -> Result<(Vec<f64>, Vec<i64>, usize, GpuTiming)> {
         let recs_bytes: &[u8] = bytemuck::cast_slice(records);
         let n_parts = (offsets.len() - 1) as i32;
         let n_rows = records.len();
+
+        // bucket-rule params for the kernels
+        let k = rules.num_buckets();
+        let intraday: i32 = if rules.intraday_same_day { 1 } else { 0 };
+        let n_bounds = rules.n_bounds as i32;
+        let bounds_host: Vec<i32> = if rules.n_bounds == 0 {
+            vec![0]
+        } else {
+            rules.boundaries[..rules.n_bounds].to_vec()
+        };
 
         // Split partitions: big ones (>= threshold) go to the within-partition
         // kernel, the rest to the one-thread-per-partition kernel.
@@ -346,8 +372,9 @@ impl GpuEngine {
         let d_recs = self.dev.htod_sync_copy(recs_bytes)?;
         let d_offsets = self.dev.htod_sync_copy(offsets)?;
         let d_lots = self.dev.alloc_zeros::<u8>(n_rows * 24)?; // sizeof(Lot)
-        let mut d_realized = self.dev.alloc_zeros::<f64>(n_parts as usize * 3)?;
-        let mut d_qty = self.dev.alloc_zeros::<i64>(n_parts as usize * 3)?;
+        let mut d_realized = self.dev.alloc_zeros::<f64>(n_parts as usize * k)?;
+        let mut d_qty = self.dev.alloc_zeros::<i64>(n_parts as usize * k)?;
+        let d_bounds = self.dev.htod_sync_copy(&bounds_host)?;
         // Per-record scratch for the big-partition kernel. buys and sells share
         // these arrays (buys [start..start+nb), sells [start+nb..end)), so one
         // set of full-width arrays suffices — 20 B/row, not 40.
@@ -371,6 +398,10 @@ impl GpuEngine {
                     &d_offsets,
                     n_parts,
                     big_threshold,
+                    intraday,
+                    n_bounds,
+                    &d_bounds,
+                    k as i32,
                     &d_lots,
                     &mut d_realized,
                     &mut d_qty,
@@ -393,6 +424,10 @@ impl GpuEngine {
                         &d_offsets,
                         &d_big_parts,
                         n_big as i32,
+                        intraday,
+                        n_bounds,
+                        &d_bounds,
+                        k as i32,
                         &mut d_cum,
                         &mut d_price,
                         &mut d_day,
@@ -418,15 +453,13 @@ impl GpuEngine {
             total_ms: t_all.elapsed().as_secs_f64() * 1e3,
         };
 
-        let per_realized: Vec<[f64; 3]> = realized.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-        let per_qty: Vec<[i64; 3]> = qty.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-        Ok((per_realized, per_qty, timing))
+        Ok((realized, qty, k, timing))
     }
 
     /// Whole-table totals as a [`PartitionPnl`] (realized PnL via f64 → ticks).
-    pub fn fold_total(&self, table: &PackedTable) -> Result<(PartitionPnl, GpuTiming)> {
-        let (realized, qty, timing) = self.fold_all(table)?;
-        Ok((sum_pnl(&realized, &qty), timing))
+    pub fn fold_total(&self, table: &PackedTable, rules: &BucketRules) -> Result<(PartitionPnl, GpuTiming)> {
+        let (realized, qty, k, timing) = self.fold_all(table, rules)?;
+        Ok((sum_pnl(&realized, &qty, k), timing))
     }
 
     /// Streamed whole-table fold (Decision 5): process the table in
@@ -505,6 +538,9 @@ impl GpuEngine {
         // — no per-chunk device→host sync, which is what lets the streams overlap.
         let mut d_real = self.dev.alloc_zeros::<f64>(n_parts * 3)?;
         let mut d_qty = self.dev.alloc_zeros::<i64>(n_parts * 3)?;
+        // The streamed arm uses the default 3-bucket ruleset (intraday/≤365d/long);
+        // custom K-bucket rulesets use the non-streamed fold_query path.
+        let d_bounds = self.dev.htod_sync_copy(&[365i32])?;
 
         let mut used = [false; 2];
         let t0 = std::time::Instant::now();
@@ -551,6 +587,10 @@ impl GpuEngine {
                         &d_off[slot],
                         parts as i32,
                         big_threshold,
+                        1i32,        // intraday_same_day
+                        1i32,        // n_bounds
+                        &d_bounds,
+                        3i32,        // k (default buckets)
                         &d_lots[slot],
                         &mut d_real.slice_mut(cp0 * 3..cp1 * 3),
                         &mut d_qty.slice_mut(cp0 * 3..cp1 * 3),
@@ -573,6 +613,10 @@ impl GpuEngine {
                             &d_off[slot],
                             &d_bigp[slot],
                             nbig as i32,
+                            1i32,        // intraday_same_day
+                            1i32,        // n_bounds
+                            &d_bounds,
+                            3i32,        // k (default buckets)
                             &mut d_cum[slot],
                             &mut d_price[slot],
                             &mut d_day[slot],
@@ -605,17 +649,18 @@ impl GpuEngine {
     }
 }
 
-/// Sum per-partition GPU outputs into a single [`PartitionPnl`] (realized PnL
-/// rounded from the on-device f64 accumulator back to integer ticks).
-fn sum_pnl(realized: &[[f64; 3]], qty: &[[i64; 3]]) -> PartitionPnl {
-    // The GPU kernel emits the 3 default buckets (intraday/short/long = 0/1/2);
-    // K-bucket rulesets are CPU-only (see DESIGN.md A.3).
+/// Sum flat per-partition GPU outputs (`n_parts * k`) into a single
+/// [`PartitionPnl`] (realized PnL rounded from the on-device f64 accumulator
+/// back to integer ticks). The kernel emits the K buckets the active
+/// [`BucketRules`] defines.
+fn sum_pnl(realized: &[f64], qty: &[i64], k: usize) -> PartitionPnl {
     let mut pnl = PartitionPnl::default();
-    for (r, q) in realized.iter().zip(qty.iter()) {
-        for b in 0..3 {
+    let n_parts = if k > 0 { realized.len() / k } else { 0 };
+    for p in 0..n_parts {
+        for b in 0..k {
             pnl.bucket_mut(b).merge(&BucketPnl {
-                realized_ticks: r[b].round() as i128,
-                matched_qty: q[b] as i128,
+                realized_ticks: realized[p * k + b].round() as i128,
+                matched_qty: qty[p * k + b] as i128,
                 fragments: 0,
             });
         }

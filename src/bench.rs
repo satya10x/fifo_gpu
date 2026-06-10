@@ -191,7 +191,7 @@ pub fn run_bench(
         {
             if let Span::Full = q.span {
                 let parts = crate::query::select_partitions(table, q);
-                let (gpnl, t) = gpu_engine.fold_query(table, &parts)?;
+                let (gpnl, t) = gpu_engine.fold_query(table, &parts, &rules)?;
                 gpu_ms = Some(t.total_ms);
                 gpu_h2d_ms = Some(t.h2d_ms);
                 gpu_kernel_ms = Some(t.kernel_ms);
@@ -341,7 +341,7 @@ fn run_gpu_arm(table: &PackedTable) -> Result<()> {
     use crate::gpu::GpuEngine;
     println!("\n── GPU arm (all-history full-table fold) ────────────────────");
     let eng = GpuEngine::new(0)?;
-    let (gpu_pnl, t) = eng.fold_total(table)?;
+    let (gpu_pnl, t) = eng.fold_total(table, &crate::fifo::BucketRules::default())?;
     let (cpu_pnl, cpu_ms) = timed(|| fold_table(table, &mut NoopSink));
     println!(
         "  disk+H2D: {:.1} ms | kernel: {:.1} ms | D2H: {:.1} ms | total: {:.1} ms",

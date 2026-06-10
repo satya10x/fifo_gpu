@@ -133,6 +133,10 @@ struct QueryArgs {
     /// checkpoints; full-history is fine on any policy.
     #[arg(long, default_value = "fifo")]
     policy: String,
+    /// Run on the GPU (full-history + FIFO only; requires `--features gpu`).
+    /// Honors `--bands` / `--ltcg-days` (K-way bucketing, A.3).
+    #[arg(long)]
+    gpu: bool,
 }
 
 #[derive(Parser)]
@@ -330,6 +334,34 @@ fn main() -> Result<()> {
                 "hifo" => MatchPolicy::Hifo,
                 other => anyhow::bail!("unknown --policy {other:?} (expected fifo|lifo|hifo)"),
             };
+
+            if args.gpu {
+                #[cfg(feature = "gpu")]
+                {
+                    if !matches!(span, Span::Full) {
+                        anyhow::bail!("--gpu supports full-history only (drop --from/--to)");
+                    }
+                    if policy != MatchPolicy::Fifo {
+                        anyhow::bail!("--gpu supports FIFO only (use CPU for lifo/hifo)");
+                    }
+                    let parts = fifo_gpu::query::select_partitions(&table, &q);
+                    let eng = fifo_gpu::gpu::GpuEngine::new(0)?;
+                    let t0 = std::time::Instant::now();
+                    let (pnl, timing) = eng.fold_query(&table, &parts, &rules)?;
+                    println!("Query (GPU): {:?} symbol={:?} span={:?}", args.client, args.symbol, span);
+                    println!(
+                        "  {} partitions, {} buckets, GPU H2D {:.1}ms / kernel {:.1}ms / total {:.1}ms (wall {:.2}ms)",
+                        parts.len(), rules.num_buckets(),
+                        timing.h2d_ms, timing.kernel_ms, timing.total_ms,
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                    print_pnl(&rules, &pnl);
+                    return Ok(());
+                }
+                #[cfg(not(feature = "gpu"))]
+                anyhow::bail!("--gpu requires building with --features gpu");
+            }
+
             let t0 = std::time::Instant::now();
             let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink, &rules, policy)?;
             let dt = t0.elapsed();

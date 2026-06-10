@@ -63,8 +63,12 @@ instead of a fixed 3.
   index; `BucketRules` takes arbitrary ascending holding-day bands
   (`BucketRules::bands`); exposed as `fifo query --bands 30,365`. CPU honors any
   K-band ruleset; the GPU still emits the 3 default buckets (A.3).
-- **A.3:** thread thresholds + K into the GPU kernels (param array; K-way
-  segmented-reduce) so the GPU honors custom rulesets too.
+- **A.3 (done):** both GPU kernels take the rule params (`intraday`, `n_bounds`,
+  `bounds[]`, `k`) and segmented-reduce into K buckets (output `n_parts*k`); a
+  `bucket_of` device fn mirrors the CPU `classify`. `fold_query`/`fold_total`
+  thread `&BucketRules`; the streamed arm stays default-3. Exposed via
+  `fifo query --gpu` (full-history + FIFO), which honors `--bands`/`--ltcg-days`.
+  (Validate on the T4 — blind-coded.)
 
 ---
 
