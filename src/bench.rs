@@ -124,13 +124,13 @@ fn pick_clients(table: &PackedTable, cfg: &GenConfig) -> (u64, u64) {
 
 pub fn run_bench(
     tradebook_dir: &Path,
-    packed_path: &Path,
+    table: &PackedTable,
     ckpt_dir: &Path,
     router_log: &Path,
+    out_json: &Path,
 ) -> Result<()> {
     let manifest = Manifest::read(tradebook_dir)?;
     let cfg = &manifest.config;
-    let table = PackedTable::open(packed_path)?;
     let td = cfg.trading_days();
     let n = td.len();
     // Default bucket ruleset (intraday / short ≤365d / long) + FIFO. The GPU arm
@@ -143,10 +143,10 @@ pub fn run_bench(
     let store = CheckpointStore::new(ckpt_dir);
     let cutoffs: Vec<i32> = (1..4).map(|k| td[n * k / 4] as i32).collect();
     println!("Building {} checkpoints at cutoffs {:?} …", cutoffs.len(), cutoffs);
-    let (_, ckpt_ms) = timed(|| store.build_periodic(&table, &cutoffs));
+    let (_, ckpt_ms) = timed(|| store.build_periodic(table, &cutoffs));
     println!("  checkpoints built in {:.0} ms", ckpt_ms);
 
-    let (whale, retail) = pick_clients(&table, cfg);
+    let (whale, retail) = pick_clients(table, cfg);
     println!("Using whale client {whale}, retail client {retail}\n");
 
     let d = |i: usize| td[i.min(n - 1)] as i32;
@@ -169,14 +169,14 @@ pub fn run_bench(
     // ---- phase 1: measure every query (CPU, baseline, and GPU where applicable) ----
     let mut qrecs: Vec<QRec> = Vec::new();
     for (name, q) in &queries {
-        let (cpu_res, cpu_ms) = timed(|| run_cpu(&table, Some(&store), q, &mut NoopSink, &rules, policy).unwrap());
+        let (cpu_res, cpu_ms) = timed(|| run_cpu(table, Some(&store), q, &mut NoopSink, &rules, policy).unwrap());
         let ((base_pnl, _base_rows), base_ms) = timed(|| baseline_query(tradebook_dir, q).unwrap());
         let matches = cpu_res.pnl == base_pnl;
 
         // Diagnostic for range queries: fold the same packed data from scratch
         // (no checkpoint). Splits a mismatch into checkpoint-carry vs packed-data.
         let nockpt_pnl = match q.span {
-            Span::Range(..) => Some(run_cpu(&table, None, q, &mut NoopSink, &rules, policy)?.pnl),
+            Span::Range(..) => Some(run_cpu(table, None, q, &mut NoopSink, &rules, policy)?.pnl),
             Span::Full => None,
         };
 
@@ -190,8 +190,8 @@ pub fn run_bench(
         #[cfg(feature = "gpu")]
         {
             if let Span::Full = q.span {
-                let parts = crate::query::select_partitions(&table, q);
-                let (gpnl, t) = gpu_engine.fold_query(&table, &parts)?;
+                let parts = crate::query::select_partitions(table, q);
+                let (gpnl, t) = gpu_engine.fold_query(table, &parts)?;
                 gpu_ms = Some(t.total_ms);
                 gpu_h2d_ms = Some(t.h2d_ms);
                 gpu_kernel_ms = Some(t.kernel_ms);
@@ -320,7 +320,7 @@ pub fn run_bench(
     }
 
     // --- GPU full-table arm: detailed disk/H2D/kernel/D2H breakout (Decision 3) ---
-    run_gpu_arm(&table)?;
+    run_gpu_arm(table)?;
 
     println!("\nRouter coefficients (fitted):");
     println!("  cpu_per_row_ns      = {:.3}", fitted.cpu_per_row_ns);
@@ -330,8 +330,7 @@ pub fn run_bench(
     println!("  gpu_serial_per_row  = {:.5}", fitted.gpu_serial_per_row_ns);
     println!("  predicted-vs-actual logged to {}", router_log.display());
 
-    let out_json = packed_path.with_extension("bench.json");
-    std::fs::write(&out_json, serde_json::to_string_pretty(&rows_out)?)?;
+    std::fs::write(out_json, serde_json::to_string_pretty(&rows_out)?)?;
     println!("Bench results written to {}", out_json.display());
     Ok(())
 }

@@ -165,7 +165,23 @@ pub fn serialize_packed<W: Write>(
     records: &[PackedTrade],
     w: &mut W,
 ) -> Result<()> {
-    let n_rows = records.len() as u64;
+    serialize_prefix(part_client, part_symbol, part_offset, w)?;
+    w.write_all(bytemuck::cast_slice(records))?;
+    Ok(())
+}
+
+/// Serialize everything *except* the records — the header and partition arrays,
+/// padded up to the records offset. The caller then appends exactly
+/// `part_offset.last()` records' worth of bytes to complete the buffer. Lets the
+/// Lance fast path stream the transparent `rec` column straight into the packed
+/// buffer (one copy, no intermediate `Vec<PackedTrade>`).
+pub fn serialize_prefix<W: Write>(
+    part_client: &[u64],
+    part_symbol: &[u32],
+    part_offset: &[u64],
+    w: &mut W,
+) -> Result<()> {
+    let n_rows = *part_offset.last().unwrap_or(&0);
     let n_parts = part_client.len() as u64;
     debug_assert_eq!(part_offset.len() as u64, n_parts + 1);
 
@@ -203,7 +219,6 @@ pub fn serialize_packed<W: Write>(
     w.write_all(bytemuck::cast_slice(part_offset))?;
     pos += (n_parts + 1) * 8;
     pad_to(w, &mut pos, off_records)?;
-    w.write_all(bytemuck::cast_slice(records))?;
     Ok(())
 }
 

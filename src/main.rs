@@ -25,6 +25,23 @@ fn print_pnl(rules: &fifo_gpu::fifo::BucketRules, p: &PartitionPnl) {
     );
 }
 
+/// Resolve the compute table source: a Lance dataset (`--uri`, needs
+/// `--features lance`) if given, else the packed `.fifopack` file.
+fn source_table(packed: &std::path::Path, uri: &Option<PathBuf>) -> Result<PackedTable> {
+    if let Some(u) = uri {
+        let u = u.to_str().ok_or_else(|| anyhow::anyhow!("--uri is not valid UTF-8"))?;
+        #[cfg(feature = "lance")]
+        {
+            return fifo_gpu::lance_store::open(u);
+        }
+        #[cfg(not(feature = "lance"))]
+        {
+            anyhow::bail!("--uri ({u}) requires building with --features lance");
+        }
+    }
+    PackedTable::open(packed)
+}
+
 #[derive(Parser)]
 #[command(name = "fifo", about = "GPU/CPU FIFO PnL on a Lance-backed store")]
 struct Cli {
@@ -82,6 +99,10 @@ struct CheckpointArgs {
 struct QueryArgs {
     #[arg(long, default_value = "data/compute.fifopack")]
     packed: PathBuf,
+    /// Read the compute table from a Lance dataset instead of `--packed`
+    /// (requires `--features lance`).
+    #[arg(long)]
+    uri: Option<PathBuf>,
     /// Client id; omit for a cross-client query.
     #[arg(long)]
     client: Option<u64>,
@@ -144,6 +165,11 @@ struct BenchArgs {
     tradebook: PathBuf,
     #[arg(long, default_value = "data/compute.fifopack")]
     packed: PathBuf,
+    /// Read the compute table from a Lance dataset instead of `--packed`
+    /// (requires `--features lance`). The Parquet `--tradebook` is still used
+    /// for the status-quo baseline arm.
+    #[arg(long)]
+    uri: Option<PathBuf>,
     #[arg(long, default_value = "data/checkpoints")]
     checkpoints: PathBuf,
     #[arg(long, default_value = "data/router-log.jsonl")]
@@ -271,7 +297,7 @@ fn main() -> Result<()> {
             println!("Done in {:.2}s → {}", t0.elapsed().as_secs_f64(), args.out.display());
         }
         Cmd::Query(args) => {
-            let table = PackedTable::open(&args.packed)?;
+            let table = source_table(&args.packed, &args.uri)?;
             let clients = match args.client {
                 Some(c) => ClientSel::One(c),
                 None => ClientSel::All,
@@ -363,11 +389,14 @@ fn main() -> Result<()> {
             );
         }
         Cmd::Bench(args) => {
+            let table = source_table(&args.packed, &args.uri)?;
+            let out_json = args.packed.with_extension("bench.json");
             fifo_gpu::bench::run_bench(
                 &args.tradebook,
-                &args.packed,
+                &table,
                 &args.checkpoints,
                 &args.router_log,
+                &out_json,
             )?;
         }
         #[cfg(feature = "lance")]

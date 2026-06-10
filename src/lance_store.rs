@@ -14,7 +14,7 @@
 //! absent (e.g. an externally-written dataset) we fall back to reading the
 //! columns and deriving the boundaries.
 
-use crate::packed::{serialize_packed, PackedTable, PackedTrade};
+use crate::packed::{serialize_packed, serialize_prefix, PackedTable, PackedTrade};
 use anyhow::{Context, Result};
 use arrow::array::{Array, FixedSizeBinaryArray, UInt32Array, UInt64Array};
 use arrow::buffer::Buffer;
@@ -129,22 +129,6 @@ pub fn write(table: &PackedTable, uri: &str) -> Result<u64> {
     Ok(ds.version().version)
 }
 
-/// Bulk-read just the `rec` column (projection) into a contiguous records Vec.
-async fn read_records_only(uri: &str) -> Result<Vec<PackedTrade>> {
-    let ds = Dataset::open(uri).await.context("Dataset::open")?;
-    let mut scan = ds.scan();
-    scan.project(&["rec"]).context("project rec")?;
-    let mut stream = scan.try_into_stream().await.context("scan stream")?;
-    let mut records: Vec<PackedTrade> = Vec::new();
-    while let Some(batch) = stream.try_next().await? {
-        let rec = batch.column(0).as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
-        let bytes = rec.value_data();
-        debug_assert_eq!(bytes.len(), rec.len() * REC_BYTES as usize);
-        records.extend_from_slice(bytemuck::cast_slice::<u8, PackedTrade>(bytes));
-    }
-    Ok(records)
-}
-
 /// Fallback: read all columns and derive partition boundaries (for datasets
 /// without a sidecar).
 async fn read_all_and_derive(uri: &str) -> Result<(Vec<PackedTrade>, Vec<u64>, Vec<u32>, Vec<u64>)> {
@@ -187,16 +171,35 @@ async fn read_all_and_derive(uri: &str) -> Result<(Vec<PackedTrade>, Vec<u64>, V
 /// Fallback: read columns and derive boundaries.
 pub fn open(uri: &str) -> Result<PackedTable> {
     let rt = runtime()?;
-    let (records, pc, ps, poff) = match read_sidecar(uri)? {
+    match read_sidecar(uri)? {
         Some(s) => {
-            let records = rt.block_on(read_records_only(uri))?;
-            (records, s.part_client, s.part_symbol, s.part_offset)
+            // fast path, single copy: write header+partitions from the sidecar,
+            // then stream the projected `rec` column straight into the buffer.
+            let mut bytes: Vec<u8> = Vec::new();
+            serialize_prefix(&s.part_client, &s.part_symbol, &s.part_offset, &mut bytes)?;
+            rt.block_on(async {
+                let ds = Dataset::open(uri).await.context("Dataset::open")?;
+                let mut scan = ds.scan();
+                scan.project(&["rec"]).context("project rec")?;
+                let mut stream = scan.try_into_stream().await.context("scan stream")?;
+                while let Some(batch) = stream.try_next().await? {
+                    let rec = batch.column(0).as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+                    let b = rec.value_data();
+                    debug_assert_eq!(b.len(), rec.len() * REC_BYTES as usize);
+                    bytes.extend_from_slice(b);
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            PackedTable::from_bytes(bytes)
         }
-        None => rt.block_on(read_all_and_derive(uri))?,
-    };
-    let mut bytes: Vec<u8> = Vec::new();
-    serialize_packed(&pc, &ps, &poff, &records, &mut bytes)?;
-    PackedTable::from_bytes(bytes)
+        None => {
+            // fallback: read all columns, derive boundaries, then serialize
+            let (records, pc, ps, poff) = rt.block_on(read_all_and_derive(uri))?;
+            let mut bytes: Vec<u8> = Vec::new();
+            serialize_packed(&pc, &ps, &poff, &records, &mut bytes)?;
+            PackedTable::from_bytes(bytes)
+        }
+    }
 }
 
 fn read_sidecar(uri: &str) -> Result<Option<PartsSidecar>> {
