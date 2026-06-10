@@ -152,12 +152,16 @@ per-partition logic varies. FIFO-PnL is the first instance.
 - **Pipeline**: `gen` → `pack` (+page index) → `checkpoint` → `query`/`bench`/`rollup`.
 
 ## 8. Not built / deferred (honest list)
-- **Lance backend — Stage 1 DONE** (`lance_store.rs`, `--features lance`,
-  `fifo lance`): the compute table writes to a **versioned Lance dataset** and
-  reads back into an identical packed buffer (round-trip test passes). Gains
-  versioning / time-travel / correction-lineage now. **Stage 2 (zero-copy via a
-  custom transparent Lance encoding — decoder hands the GPU buffer back with no
-  repack)** is the remaining piece.
+- **Lance backend — Stage 1 & 2 DONE** (`lance_store.rs`, `--features lance`,
+  `fifo lance`): the compute table writes to a **versioned Lance dataset** with
+  the records in a **transparent `FixedSizeBinary(12)` column** (bytes = our
+  `[PackedTrade]` verbatim). On read the column buffer **is** the packed records
+  — sliced in bulk (no per-row rebuild) into an **owned-buffer `PackedTable`**
+  (no temp file) that the CPU/GPU engine runs on unchanged and the GPU DMAs
+  directly. Round-trip test: byte-identical + folds identically. Gains
+  versioning / time-travel / correction-lineage. (One bulk copy on read remains
+  — the inherent Lance→host read; pointer-handoff to skip even that is a future
+  micro-opt.)
 - **A.3** — GPU K-way bucketing (custom bands currently CPU-only).
 - **B.2 / B.1-heap** — GPU LIFO/HIFO and a HIFO max-heap; deferred (the
   within-partition kernel is FIFO-specific, so non-FIFO has no GPU parallelism →

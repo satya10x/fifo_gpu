@@ -63,10 +63,6 @@ struct LanceArgs {
     packed: PathBuf,
     #[arg(long, default_value = "data/compute.lance")]
     uri: PathBuf,
-    /// Also write the round-tripped table back to a `.fifopack` (so query/bench
-    /// can run on the Lance-sourced data).
-    #[arg(long)]
-    out: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -392,19 +388,17 @@ fn main() -> Result<()> {
                 t0.elapsed().as_secs_f64()
             );
             let t1 = std::time::Instant::now();
-            let b = fifo_gpu::lance_store::open(uri)?;
-            let identical = b.records.as_slice() == table.records();
+            let t2 = fifo_gpu::lance_store::open(uri)?;
+            let identical = t2.records() == table.records()
+                && t2.part_offset() == table.part_offset();
             println!(
-                "Read back {} rows / {} partitions in {:.2}s — records identical: {}",
-                b.records.len(),
-                b.n_parts(),
+                "Read back {} rows / {} partitions in {:.2}s — round-trip identical: {} \
+                 (owned-buffer table, GPU/CPU-ready, no temp file)",
+                t2.n_rows(),
+                t2.n_parts(),
                 t1.elapsed().as_secs_f64(),
                 identical
             );
-            if let Some(out) = &args.out {
-                b.write(out)?;
-                println!("Wrote round-tripped compute table → {}", out.display());
-            }
         }
         Cmd::Stats(args) => {
             let manifest = Manifest::read(&args.out)?;

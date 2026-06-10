@@ -134,65 +134,115 @@ impl PackedBuilder {
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        let n_rows = self.records.len() as u64;
-        let n_parts = self.part_client.len() as u64;
-        debug_assert_eq!(self.part_offset.len() as u64, n_parts + 1);
-
-        let h_size = size_of::<Header>() as u64;
-        let off_part_client = align_up(h_size, 8);
-        let off_part_symbol = align_up(off_part_client + n_parts * 8, 8);
-        let off_part_offset = align_up(off_part_symbol + n_parts * 4, 8);
-        let off_records = align_up(off_part_offset + (n_parts + 1) * 8, RECORD_ALIGN);
-        let file_len = off_records + n_rows * size_of::<PackedTrade>() as u64;
-
-        let header = Header {
-            magic: MAGIC,
-            version: 1,
-            _pad: 0,
-            n_rows,
-            n_parts,
-            tick: TICK,
-            off_part_client,
-            off_part_symbol,
-            off_part_offset,
-            off_records,
-            file_len,
-        };
-
         let mut w = BufWriter::new(File::create(path)?);
-        let mut pos = 0u64;
-        let pad_to = |w: &mut BufWriter<File>, pos: &mut u64, target: u64| -> Result<()> {
-            while *pos < target {
-                w.write_all(&[0u8])?;
-                *pos += 1;
-            }
-            Ok(())
-        };
-
-        w.write_all(bytemuck::bytes_of(&header))?;
-        pos += h_size;
-        pad_to(&mut w, &mut pos, off_part_client)?;
-        w.write_all(bytemuck::cast_slice(&self.part_client))?;
-        pos += n_parts * 8;
-        pad_to(&mut w, &mut pos, off_part_symbol)?;
-        w.write_all(bytemuck::cast_slice(&self.part_symbol))?;
-        pos += n_parts * 4;
-        pad_to(&mut w, &mut pos, off_part_offset)?;
-        w.write_all(bytemuck::cast_slice(&self.part_offset))?;
-        pos += (n_parts + 1) * 8;
-        pad_to(&mut w, &mut pos, off_records)?;
-        w.write_all(bytemuck::cast_slice(&self.records))?;
+        serialize_packed(
+            &self.part_client,
+            &self.part_symbol,
+            &self.part_offset,
+            &self.records,
+            &mut w,
+        )?;
         w.flush()?;
         Ok(())
     }
 }
 
-/// A memory-mapped, zero-copy view of a packed compute table. The `records`
-/// slice IS the on-disk buffer — no decode, no copy. This is the buffer the GPU
-/// uploader hands straight to `cudaMemcpy`.
+fn pad_to<W: Write>(w: &mut W, pos: &mut u64, target: u64) -> Result<()> {
+    while *pos < target {
+        w.write_all(&[0u8])?;
+        *pos += 1;
+    }
+    Ok(())
+}
+
+/// Serialize the packed-table layout (`[Header][part_client][part_symbol]
+/// [part_offset][records]`) to any writer. Shared by [`PackedBuilder::write`]
+/// (to a file) and the Lance backend (to an in-memory `Vec<u8>` → [`PackedTable::from_bytes`]).
+pub fn serialize_packed<W: Write>(
+    part_client: &[u64],
+    part_symbol: &[u32],
+    part_offset: &[u64],
+    records: &[PackedTrade],
+    w: &mut W,
+) -> Result<()> {
+    let n_rows = records.len() as u64;
+    let n_parts = part_client.len() as u64;
+    debug_assert_eq!(part_offset.len() as u64, n_parts + 1);
+
+    let h_size = size_of::<Header>() as u64;
+    let off_part_client = align_up(h_size, 8);
+    let off_part_symbol = align_up(off_part_client + n_parts * 8, 8);
+    let off_part_offset = align_up(off_part_symbol + n_parts * 4, 8);
+    let off_records = align_up(off_part_offset + (n_parts + 1) * 8, RECORD_ALIGN);
+    let file_len = off_records + n_rows * size_of::<PackedTrade>() as u64;
+
+    let header = Header {
+        magic: MAGIC,
+        version: 1,
+        _pad: 0,
+        n_rows,
+        n_parts,
+        tick: TICK,
+        off_part_client,
+        off_part_symbol,
+        off_part_offset,
+        off_records,
+        file_len,
+    };
+
+    let mut pos = 0u64;
+    w.write_all(bytemuck::bytes_of(&header))?;
+    pos += h_size;
+    pad_to(w, &mut pos, off_part_client)?;
+    w.write_all(bytemuck::cast_slice(part_client))?;
+    pos += n_parts * 8;
+    pad_to(w, &mut pos, off_part_symbol)?;
+    w.write_all(bytemuck::cast_slice(part_symbol))?;
+    pos += n_parts * 4;
+    pad_to(w, &mut pos, off_part_offset)?;
+    w.write_all(bytemuck::cast_slice(part_offset))?;
+    pos += (n_parts + 1) * 8;
+    pad_to(w, &mut pos, off_records)?;
+    w.write_all(bytemuck::cast_slice(records))?;
+    Ok(())
+}
+
+/// Backing bytes for a [`PackedTable`]: either an `mmap` of a `.fifopack` file
+/// (the default, true zero-copy on disk) or an owned buffer assembled in memory
+/// (e.g. by the Lance backend reading the transparent records column). Either
+/// way the `records` slice is contiguous and DMAs straight to the GPU.
+enum Backing {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Backing::Mmap(m) => &m[..],
+            Backing::Owned(v) => &v[..],
+        }
+    }
+}
+
+/// A zero-copy view of a packed compute table. The `records` slice IS the
+/// backing buffer — no decode, no copy. This is the buffer the GPU uploader
+/// hands straight to `cudaMemcpy`.
 pub struct PackedTable {
-    mmap: Mmap,
+    store: Backing,
     header: Header,
+}
+
+fn parse_header(bytes: &[u8]) -> Result<Header> {
+    ensure!(
+        bytes.len() >= size_of::<Header>(),
+        "too small to be a packed table"
+    );
+    let header: Header = *bytemuck::from_bytes(&bytes[..size_of::<Header>()]);
+    ensure!(header.magic == MAGIC, "bad magic — not a FIFOPK buffer");
+    ensure!(bytes.len() as u64 >= header.file_len, "truncated packed table");
+    Ok(header)
 }
 
 impl PackedTable {
@@ -200,23 +250,22 @@ impl PackedTable {
         let f = File::open(path)?;
         // SAFETY: file is read-only for the lifetime of the mmap.
         let mmap = unsafe { Mmap::map(&f)? };
-        ensure!(
-            mmap.len() >= size_of::<Header>(),
-            "file too small to be a packed table"
-        );
-        let header: Header = *bytemuck::from_bytes(&mmap[..size_of::<Header>()]);
-        ensure!(header.magic == MAGIC, "bad magic — not a FIFOPK file");
-        ensure!(
-            mmap.len() as u64 >= header.file_len,
-            "truncated packed table"
-        );
-        Ok(PackedTable { mmap, header })
+        let header = parse_header(&mmap)?;
+        Ok(PackedTable { store: Backing::Mmap(mmap), header })
+    }
+
+    /// Open a packed table from an in-memory buffer already in the `.fifopack`
+    /// layout (see [`serialize_packed`]). Used by the Lance backend so the
+    /// engine/GPU run on Lance-sourced data with no temp file.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        let header = parse_header(&bytes)?;
+        Ok(PackedTable { store: Backing::Owned(bytes), header })
     }
 
     #[inline]
     fn section<T: Pod>(&self, off: u64, count: u64) -> &[T] {
         let start = off as usize;
-        let bytes = &self.mmap[start..start + count as usize * size_of::<T>()];
+        let bytes = &self.store.bytes()[start..start + count as usize * size_of::<T>()];
         bytemuck::cast_slice(bytes)
     }
 
