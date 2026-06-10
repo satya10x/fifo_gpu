@@ -24,6 +24,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const REC_BYTES: i32 = 12; // size_of::<PackedTrade>()
@@ -43,9 +44,14 @@ fn sidecar_path(uri: &str) -> String {
 }
 
 fn schema() -> Arc<Schema> {
+    // zstd-compress the highly-repetitive (constant-within-partition) client/symbol
+    // columns — they're for self-description / Lance-native queries, not the fast
+    // read, so compression doesn't touch the hot path. `rec` stays UNCOMPRESSED
+    // (transparent) so the projected read is raw bytes, GPU-DMA-able.
+    let zstd = HashMap::from([("lance-encoding:compression".to_string(), "zstd".to_string())]);
     Arc::new(Schema::new(vec![
-        Field::new("client_id", DataType::UInt64, false),
-        Field::new("symbol_id", DataType::UInt32, false),
+        Field::new("client_id", DataType::UInt64, false).with_metadata(zstd.clone()),
+        Field::new("symbol_id", DataType::UInt32, false).with_metadata(zstd),
         Field::new("rec", DataType::FixedSizeBinary(REC_BYTES), false),
     ]))
 }

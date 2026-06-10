@@ -114,9 +114,11 @@ slow GPU path nobody would use. Knowing what *not* to build is a result too.
   (bytes = `[PackedTrade]` verbatim) and read into an **owned-buffer
   `PackedTable`** — no per-row rebuild, no temp file, GPU-DMA-able.
 - **Stage 2.1** — *keep* per-row `client_id`/`symbol_id` (self-describing,
-  queryable, audit-friendly; Lance RLE-compresses them ~free) **and** add a
-  compact partition **sidecar**, so the fast read **projects only `rec`** + the
-  sidecar (no redundant scan).
+  queryable, audit-friendly; **zstd-compressed** via the `lance-encoding:compression`
+  field metadata, since they're constant within a partition) **and** add a compact
+  partition **sidecar**, so the fast read **projects only `rec`** + the sidecar (no
+  redundant scan). *(Measured: without compression those columns stored ~uncompressed
+  and doubled the dataset — see Part III; compression was added after seeing that.)*
 - **Wired in** — `query`/`bench` take `--uri` to run straight off Lance; read cut
   to a single bulk copy.
 - **A.3** — both GPU kernels generalized to **K-way bucketing**; `fifo query
@@ -154,7 +156,7 @@ at ingest, never per query); and *benchmark-gated* everything.
 | **Random access** | scan whole matched partitions | byte-addressable; page-range index prunes to the range |
 | **Versioning / time-travel** | none (rewrite files) | built-in versioned snapshots, ACID — reproducible training sets, honest backtests |
 | **Corrections / lineage** | rewrite | regenerate one partition, bump version |
-| **Self-describing** | yes (columns) | yes (we kept per-row `client/symbol`; RLE-compressed ~free) + compact sidecar for fast loads |
+| **Self-describing** | yes (columns) | yes (per-row `client/symbol`, **zstd-compressed** since constant-within-partition) + compact sidecar for fast loads |
 | **GPU-direct** | no (decode step) | yes — the whole reason for the transparent layout |
 
 **Two measured wins over the Parquet baseline (168 M rows):**
@@ -215,6 +217,25 @@ is now compute-bound, so the next lever is kernel throughput, not fewer bytes.
 | write (versioned dataset + sidecar) | ~13 s | keeps self-describing columns |
 | read Stage 2 (all columns) | 6.66 s | derive partitions by scan |
 | **read Stage 2.1 (project `rec` + sidecar)** | **3.77 s** | ~1.8× faster load |
+
+### On-disk storage footprint (168 M, measured with `du -sh`)
+
+| store | on disk | what |
+|---|---|---|
+| Parquet tradebook (`data/big`) | **1.6 GB** | wide source, compressed |
+| Packed compute table (`.fifopack`) | **1.9 GB** | transparent, **uncompressed** (GPU-direct, by design — Decision 5) |
+| Lance dataset, **one version, uncompressed cols** | **3.8 GB** | `rec` ~2 GB + per-row client/symbol ~1.8 GB *(uncompressed)* |
+| — same, **two retained versions** | 7.6 GB | versioning copies on overwrite until compaction |
+| — **one version, client/symbol zstd** | **~2 GB (expected)** | redundant columns crushed; ≈ fifopack, self-description kept |
+| Partition sidecar (`.parts.json`) | 1.3 MB | compact 74 k `(client,symbol,offset)` triples |
+
+**Findings:** (1) the packed format is slightly *larger* than Parquet on disk
+because it's deliberately uncompressed for GPU-direct reads — a tiny price for the
+~10× faster read. (2) Lance defaulted to **uncompressed** per-row columns (~24 B/row),
+making a version ~2× the packed store; **zstd on those columns** (constant within a
+partition) recovers ~1.8 GB → Lance ≈ fifopack while keeping self-description.
+(3) overwrites **retain old versions** (time-travel) — compact / `rm`+rewrite to
+reclaim.
 
 ### Crossover, in one sentence
 **CPU wins selective/point/range queries (no transfer tax — 100×–10⁷× over the
