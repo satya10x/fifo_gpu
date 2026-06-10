@@ -80,13 +80,13 @@ __global__ void fifo_kernel(
     int          intraday,
     int          n_bounds,
     const int*   bounds,
-    int          k,              // number of buckets (<= MAXB)
     Lot*         lots,           // scratch, one slot per record (worst case all-open)
     double*      out_realized,   // [n_parts*k]
     long long*   out_qty)        // [n_parts*k]
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_parts) return;
+    int k = intraday + n_bounds + 1;   // number of buckets (<= MAXB)
 
     unsigned long long start = offsets[p];
     unsigned long long end   = offsets[p + 1];
@@ -134,7 +134,6 @@ __global__ void fifo_kernel_big(
     int          intraday,
     int          n_bounds,
     const int*   bounds,
-    int          k,
     // per-record scratch, indexed from each partition's `start`. buys and sells
     // share these arrays: buys occupy [start, start+nb), sells [start+nb, end).
     // Since nb+ns == partition size, one set of full-width arrays suffices (half
@@ -146,6 +145,7 @@ __global__ void fifo_kernel_big(
     int blk = blockIdx.x;
     if (blk >= n_big) return;
     int p = (int)big_parts[blk];
+    int k = intraday + n_bounds + 1;   // number of buckets (<= MAXB)
 
     unsigned long long start = offsets[p];
     unsigned long long end   = offsets[p + 1];
@@ -401,7 +401,6 @@ impl GpuEngine {
                     intraday,
                     n_bounds,
                     &d_bounds,
-                    k as i32,
                     &d_lots,
                     &mut d_realized,
                     &mut d_qty,
@@ -427,7 +426,6 @@ impl GpuEngine {
                         intraday,
                         n_bounds,
                         &d_bounds,
-                        k as i32,
                         &mut d_cum,
                         &mut d_price,
                         &mut d_day,
@@ -590,7 +588,6 @@ impl GpuEngine {
                         1i32,        // intraday_same_day
                         1i32,        // n_bounds
                         &d_bounds,
-                        3i32,        // k (default buckets)
                         &d_lots[slot],
                         &mut d_real.slice_mut(cp0 * 3..cp1 * 3),
                         &mut d_qty.slice_mut(cp0 * 3..cp1 * 3),
@@ -616,7 +613,6 @@ impl GpuEngine {
                             1i32,        // intraday_same_day
                             1i32,        // n_bounds
                             &d_bounds,
-                            3i32,        // k (default buckets)
                             &mut d_cum[slot],
                             &mut d_price[slot],
                             &mut d_day[slot],
@@ -643,9 +639,8 @@ impl GpuEngine {
             }
         }
 
-        let out_real: Vec<[f64; 3]> = rv.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-        let out_qty: Vec<[i64; 3]> = qv.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-        Ok((sum_pnl(&out_real, &out_qty), total_ms, pinned))
+        // streamed arm uses the default 3-bucket ruleset
+        Ok((sum_pnl(&rv, &qv, 3), total_ms, pinned))
     }
 }
 
