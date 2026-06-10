@@ -7,9 +7,10 @@
 //! router (M7) needs: `rows_touched`, `partition_fanout`, `checkpoints_loaded`.
 
 use crate::checkpoint::CheckpointStore;
-use crate::fifo::{MatchPolicy, fold_core, BucketRules, FragmentSink, PartitionPnl};
+use crate::fifo::{MatchPolicy, fold_core, fold_core_nosink, BucketRules, FragmentSink, PartitionPnl};
 use crate::packed::PackedTable;
 use anyhow::Result;
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +57,110 @@ pub fn select_partitions(table: &PackedTable, q: &Query) -> Vec<usize> {
                 .collect()
         }
     }
+}
+
+pub fn run_cpu_nosink(
+    table: &PackedTable,
+    ckpt: Option<&CheckpointStore>,
+    q: &Query,
+    rules: &BucketRules,
+    policy: MatchPolicy,
+) -> Result<QueryResult> {
+    let pc = table.part_client();
+    let ps = table.part_symbol();
+    let parts = select_partitions(table, q);
+
+    let (cutoff, ckpt_snap) = match (q.span, ckpt) {
+        (Span::Range(lo, _), Some(store)) => {
+            let snap = store.load_nearest_before(lo)?;
+            let cutoff = snap.as_ref().map(|c| c.cutoff_day).unwrap_or(i32::MIN);
+            (cutoff, snap)
+        }
+        _ => (i32::MIN, None),
+    };
+
+    if matches!(q.span, Span::Full) && parts.len() >= 32 {
+        let fold_part = |&p: &usize| {
+            let (client, symbol) = (pc[p], ps[p]);
+            let recs = table.partition(p);
+            let mut out = QueryResult::default();
+            out.partition_fanout = 1;
+            match q.span {
+                Span::Full => {
+                    out.rows_touched = recs.len() as u64;
+                    out.max_partition_rows = recs.len() as u64;
+                    let mut carry = VecDeque::new();
+                    out.pnl = fold_core_nosink(&mut carry, recs, None, rules, policy);
+                }
+                Span::Range(lo, hi) => {
+                    let mut carry = ckpt_snap
+                        .as_ref()
+                        .map(|c| c.carry_for(client, symbol))
+                        .unwrap_or_default();
+                    if !carry.is_empty() {
+                        out.checkpoints_loaded = 1;
+                    }
+                    let replay = table.day_range(recs, cutoff.saturating_add(1), hi);
+                    out.rows_touched = replay.len() as u64;
+                    out.max_partition_rows = replay.len() as u64;
+                    out.pnl = fold_core_nosink(&mut carry, replay, Some((lo, hi)), rules, policy);
+                }
+            }
+            out
+        };
+        let reduce_out = |mut a: QueryResult, b: QueryResult| {
+            if rules.is_default_equity() {
+                a.pnl.merge_default3(&b.pnl);
+            } else {
+                a.pnl.merge(&b.pnl);
+            }
+            a.rows_touched += b.rows_touched;
+            a.partition_fanout += b.partition_fanout;
+            a.max_partition_rows = a.max_partition_rows.max(b.max_partition_rows);
+            a.checkpoints_loaded += b.checkpoints_loaded;
+            a
+        };
+        let out = if parts.len() >= 1024 {
+            parts.par_iter().with_min_len(64).map(fold_part).reduce(QueryResult::default, reduce_out)
+        } else {
+            parts.par_iter().map(fold_part).reduce(QueryResult::default, reduce_out)
+        };
+        return Ok(out);
+    }
+
+    let mut out = QueryResult::default();
+    for &p in &parts {
+        let (client, symbol) = (pc[p], ps[p]);
+        let recs = table.partition(p);
+        let part_pnl = match q.span {
+            Span::Full => {
+                out.rows_touched += recs.len() as u64;
+                out.max_partition_rows = out.max_partition_rows.max(recs.len() as u64);
+                let mut carry = VecDeque::new();
+                fold_core_nosink(&mut carry, recs, None, rules, policy)
+            }
+            Span::Range(lo, hi) => {
+                let mut carry = ckpt_snap
+                    .as_ref()
+                    .map(|c| c.carry_for(client, symbol))
+                    .unwrap_or_default();
+                if !carry.is_empty() {
+                    out.checkpoints_loaded += 1;
+                }
+                let replay = table.day_range(recs, cutoff.saturating_add(1), hi);
+                out.rows_touched += replay.len() as u64;
+                out.max_partition_rows = out.max_partition_rows.max(replay.len() as u64);
+                fold_core_nosink(&mut carry, replay, Some((lo, hi)), rules, policy)
+            }
+        };
+        if rules.is_default_equity() {
+            out.pnl.merge_default3(&part_pnl);
+        } else {
+            out.pnl.merge(&part_pnl);
+        }
+        out.partition_fanout += 1;
+    }
+    Ok(out)
 }
 
 pub fn run_cpu<S: FragmentSink>(
@@ -134,7 +239,7 @@ mod tests {
         let t = PackedTable::open(&path).unwrap();
 
         let q = Query { clients: ClientSel::One(7), symbol: None, span: Span::Full };
-        let r = run_cpu(&t, None, &q, &mut NoopSink, &BucketRules::default(), MatchPolicy::Fifo).unwrap();
+        let r = run_cpu_nosink(&t, None, &q, &BucketRules::default(), MatchPolicy::Fifo).unwrap();
 
         let mut want = fold_partition(7, 1, &a, &mut NoopSink);
         want.merge(&fold_partition(7, 2, &c, &mut NoopSink));

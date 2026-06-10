@@ -11,7 +11,7 @@
 //! Checkpoints are also the seam for whale segmenting (split a huge partition at
 //! cutoffs with carried state) and are versioned by cutoff day on disk.
 
-use crate::fifo::{MatchPolicy, fold_core, BucketRules, Lot, NoopSink};
+use crate::fifo::{MatchPolicy, fold_core_nosink, BucketRules, Lot};
 use crate::packed::PackedTable;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ impl Checkpoint {
                 continue;
             }
             let mut carry: VecDeque<Lot> = VecDeque::new();
-            fold_core(pc[p], ps[p], &mut carry, in_scope, &mut NoopSink, None, &BucketRules::default(), MatchPolicy::Fifo);
+            fold_core_nosink(&mut carry, in_scope, None, &BucketRules::default(), MatchPolicy::Fifo);
             if !carry.is_empty() {
                 lots.insert(part_key(pc[p], ps[p]), carry.into_iter().collect());
             }
@@ -157,7 +157,7 @@ impl CheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fifo::{MatchPolicy, fold_partition, NoopSink};
+    use crate::fifo::{MatchPolicy, fold_core, fold_partition, NoopSink};
     use crate::packed::{PackedBuilder, PackedTrade};
 
     fn rec(sq: i32, px: i32, day: i32) -> PackedTrade {

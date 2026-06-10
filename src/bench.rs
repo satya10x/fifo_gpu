@@ -12,10 +12,10 @@
 use crate::baseline::baseline_query;
 use crate::checkpoint::CheckpointStore;
 use crate::config::GenConfig;
-use crate::fifo::{MatchPolicy, BucketRules, NoopSink, PartitionPnl};
+use crate::fifo::{MatchPolicy, BucketRules, PartitionPnl};
 use crate::manifest::Manifest;
 use crate::packed::PackedTable;
-use crate::query::{run_cpu, ClientSel, Query, Span};
+use crate::query::{run_cpu_nosink, ClientSel, Query, Span};
 use crate::router::{self, Observation};
 use anyhow::Result;
 use serde::Serialize;
@@ -169,14 +169,14 @@ pub fn run_bench(
     // ---- phase 1: measure every query (CPU, baseline, and GPU where applicable) ----
     let mut qrecs: Vec<QRec> = Vec::new();
     for (name, q) in &queries {
-        let (cpu_res, cpu_ms) = timed(|| run_cpu(&table, Some(&store), q, &mut NoopSink, &rules, policy).unwrap());
+        let (cpu_res, cpu_ms) = timed(|| run_cpu_nosink(&table, Some(&store), q, &rules, policy).unwrap());
         let ((base_pnl, _base_rows), base_ms) = timed(|| baseline_query(tradebook_dir, q).unwrap());
         let matches = cpu_res.pnl == base_pnl;
 
         // Diagnostic for range queries: fold the same packed data from scratch
         // (no checkpoint). Splits a mismatch into checkpoint-carry vs packed-data.
         let nockpt_pnl = match q.span {
-            Span::Range(..) => Some(run_cpu(&table, None, q, &mut NoopSink, &rules, policy)?.pnl),
+            Span::Range(..) => Some(run_cpu_nosink(&table, None, q, &rules, policy)?.pnl),
             Span::Full => None,
         };
 

@@ -62,6 +62,10 @@ impl BucketRules {
     pub fn num_buckets(&self) -> usize {
         usize::from(self.intraday_same_day) + self.n_bounds + 1
     }
+    #[inline]
+    pub fn is_default_equity(&self) -> bool {
+        self.intraday_same_day && self.n_bounds == 1 && self.boundaries[0] == LONG_TERM_DAYS
+    }
     /// Human label for bucket `i` (e.g. "intraday", "0-365d", ">365d").
     pub fn label(&self, i: usize) -> String {
         let mut idx = i;
@@ -218,6 +222,12 @@ impl PartitionPnl {
     pub fn bucket_mut(&mut self, i: usize) -> &mut BucketPnl {
         &mut self.buckets[i]
     }
+    #[inline]
+    pub fn merge_default3(&mut self, o: &PartitionPnl) {
+        self.buckets[0].merge(&o.buckets[0]);
+        self.buckets[1].merge(&o.buckets[1]);
+        self.buckets[2].merge(&o.buckets[2]);
+    }
     pub fn merge(&mut self, o: &PartitionPnl) {
         for i in 0..MAX_BUCKETS {
             self.buckets[i].merge(&o.buckets[i]);
@@ -255,6 +265,10 @@ pub fn fold_core<S: FragmentSink>(
     rules: &BucketRules,
     policy: MatchPolicy,
 ) -> PartitionPnl {
+    if policy == MatchPolicy::Fifo {
+        return fold_core_fifo(client, symbol, carry, recs, sink, count, rules);
+    }
+
     let mut pnl = PartitionPnl::default();
     for r in recs {
         if r.signed_qty > 0 {
@@ -306,6 +320,338 @@ pub fn fold_core<S: FragmentSink>(
                 }
             }
         }
+    }
+    pnl
+}
+
+fn fold_core_fifo<S: FragmentSink>(
+    client: u64,
+    symbol: u32,
+    carry: &mut VecDeque<Lot>,
+    recs: &[PackedTrade],
+    sink: &mut S,
+    count: Option<(i32, i32)>,
+    rules: &BucketRules,
+) -> PartitionPnl {
+    let mut pnl = PartitionPnl::default();
+    for r in recs {
+        if r.signed_qty > 0 {
+            carry.push_back(Lot {
+                qty: r.signed_qty as i64,
+                price_ticks: r.price_ticks as i64,
+                day: r.day,
+            });
+            continue;
+        }
+        if r.signed_qty >= 0 {
+            continue;
+        }
+
+        let mut remaining = -(r.signed_qty as i64);
+        let sell_ticks = r.price_ticks as i64;
+        let sell_day = r.day;
+        let counted = match count {
+            Some((lo, hi)) => sell_day >= lo && sell_day <= hi,
+            None => true,
+        };
+        while remaining > 0 {
+            let Some(lot) = carry.front_mut() else {
+                break;
+            };
+            let matched = remaining.min(lot.qty);
+            let buy_day = lot.day;
+            let buy_ticks = lot.price_ticks;
+            lot.qty -= matched;
+            if counted {
+                let bucket = classify(rules, buy_day, sell_day);
+                let frag = Fragment {
+                    client,
+                    symbol,
+                    buy_day,
+                    sell_day,
+                    matched_qty: matched,
+                    buy_ticks,
+                    sell_ticks,
+                    bucket,
+                };
+                pnl.bucket_mut(bucket).add_frag(frag.realized_ticks(), matched);
+                sink.emit(&frag);
+            }
+            remaining -= matched;
+            if lot.qty == 0 {
+                carry.pop_front();
+            }
+        }
+    }
+    pnl
+}
+
+pub fn fold_core_nosink(
+    carry: &mut VecDeque<Lot>,
+    recs: &[PackedTrade],
+    count: Option<(i32, i32)>,
+    rules: &BucketRules,
+    policy: MatchPolicy,
+) -> PartitionPnl {
+    if policy == MatchPolicy::Fifo {
+        if is_default_equity_rules(rules) {
+            return match count {
+                None => fold_core_fifo_default_full_nosink(carry, recs),
+                Some(_) => fold_core_fifo_default_nosink(carry, recs, count),
+            };
+        }
+        return fold_core_fifo_nosink(carry, recs, count, rules);
+    }
+
+    let mut pnl = PartitionPnl::default();
+    for r in recs {
+        if r.signed_qty > 0 {
+            carry.push_back(Lot {
+                qty: r.signed_qty as i64,
+                price_ticks: r.price_ticks as i64,
+                day: r.day,
+            });
+        } else if r.signed_qty < 0 {
+            let mut remaining = -(r.signed_qty as i64);
+            let sell_ticks = r.price_ticks as i64;
+            let sell_day = r.day;
+            let counted = match count {
+                Some((lo, hi)) => sell_day >= lo && sell_day <= hi,
+                None => true,
+            };
+            while remaining > 0 {
+                if carry.is_empty() {
+                    break;
+                }
+                let idx = pick_lot(carry, policy);
+                let (matched, buy_day, buy_ticks, drained) = {
+                    let lot = &mut carry[idx];
+                    let matched = remaining.min(lot.qty);
+                    lot.qty -= matched;
+                    (matched, lot.day, lot.price_ticks, lot.qty == 0)
+                };
+                if counted {
+                    let bucket = classify(rules, buy_day, sell_day);
+                    let realized = matched as i128 * (sell_ticks - buy_ticks) as i128;
+                    pnl.bucket_mut(bucket).add_frag(realized, matched);
+                }
+                remaining -= matched;
+                if drained {
+                    carry.remove(idx);
+                }
+            }
+        }
+    }
+    pnl
+}
+
+#[inline]
+fn is_default_equity_rules(rules: &BucketRules) -> bool {
+    rules.is_default_equity()
+}
+
+fn fold_core_fifo_default_full_nosink(
+    carry: &mut VecDeque<Lot>,
+    recs: &[PackedTrade],
+) -> PartitionPnl {
+    let mut pnl = PartitionPnl::default();
+    let mut lots = Vec::with_capacity(carry.len() + recs.len());
+    lots.extend(carry.drain(..));
+    let mut head = 0usize;
+
+    let mut realized0 = 0i128;
+    let mut realized1 = 0i128;
+    let mut realized2 = 0i128;
+    let mut qty0 = 0i128;
+    let mut qty1 = 0i128;
+    let mut qty2 = 0i128;
+    let mut frags0 = 0u64;
+    let mut frags1 = 0u64;
+    let mut frags2 = 0u64;
+
+    for r in recs {
+        if r.signed_qty > 0 {
+            lots.push(Lot {
+                qty: r.signed_qty as i64,
+                price_ticks: r.price_ticks as i64,
+                day: r.day,
+            });
+            continue;
+        }
+        if r.signed_qty >= 0 {
+            continue;
+        }
+
+        let mut remaining = -(r.signed_qty as i64);
+        let sell_ticks = r.price_ticks as i64;
+        let sell_day = r.day;
+        while remaining > 0 && head < lots.len() {
+            let lot = &mut lots[head];
+            let matched = remaining.min(lot.qty);
+            let buy_day = lot.day;
+            let buy_ticks = lot.price_ticks;
+            lot.qty -= matched;
+            let realized = matched as i128 * (sell_ticks - buy_ticks) as i128;
+            let span = sell_day - buy_day;
+            if span == 0 {
+                realized0 += realized;
+                qty0 += matched as i128;
+                frags0 += 1;
+            } else if span <= LONG_TERM_DAYS {
+                realized1 += realized;
+                qty1 += matched as i128;
+                frags1 += 1;
+            } else {
+                realized2 += realized;
+                qty2 += matched as i128;
+                frags2 += 1;
+            }
+            remaining -= matched;
+            if lot.qty == 0 {
+                head += 1;
+            }
+        }
+    }
+
+    if head < lots.len() {
+        carry.extend(lots.into_iter().skip(head));
+    }
+    pnl.buckets[0] = BucketPnl { realized_ticks: realized0, matched_qty: qty0, fragments: frags0 };
+    pnl.buckets[1] = BucketPnl { realized_ticks: realized1, matched_qty: qty1, fragments: frags1 };
+    pnl.buckets[2] = BucketPnl { realized_ticks: realized2, matched_qty: qty2, fragments: frags2 };
+    pnl
+}
+
+fn fold_core_fifo_default_nosink(
+    carry: &mut VecDeque<Lot>,
+    recs: &[PackedTrade],
+    count: Option<(i32, i32)>,
+) -> PartitionPnl {
+    let mut pnl = PartitionPnl::default();
+    let mut lots = Vec::with_capacity(carry.len() + recs.len());
+    lots.extend(carry.drain(..));
+    let mut head = 0usize;
+
+    let mut realized0 = 0i128;
+    let mut realized1 = 0i128;
+    let mut realized2 = 0i128;
+    let mut qty0 = 0i128;
+    let mut qty1 = 0i128;
+    let mut qty2 = 0i128;
+    let mut frags0 = 0u64;
+    let mut frags1 = 0u64;
+    let mut frags2 = 0u64;
+
+    for r in recs {
+        if r.signed_qty > 0 {
+            lots.push(Lot {
+                qty: r.signed_qty as i64,
+                price_ticks: r.price_ticks as i64,
+                day: r.day,
+            });
+            continue;
+        }
+        if r.signed_qty >= 0 {
+            continue;
+        }
+
+        let mut remaining = -(r.signed_qty as i64);
+        let sell_ticks = r.price_ticks as i64;
+        let sell_day = r.day;
+        let counted = match count {
+            Some((lo, hi)) => sell_day >= lo && sell_day <= hi,
+            None => true,
+        };
+        while remaining > 0 && head < lots.len() {
+            let lot = &mut lots[head];
+            let matched = remaining.min(lot.qty);
+            let buy_day = lot.day;
+            let buy_ticks = lot.price_ticks;
+            lot.qty -= matched;
+            if counted {
+                let realized = matched as i128 * (sell_ticks - buy_ticks) as i128;
+                let span = sell_day - buy_day;
+                if span == 0 {
+                    realized0 += realized;
+                    qty0 += matched as i128;
+                    frags0 += 1;
+                } else if span <= LONG_TERM_DAYS {
+                    realized1 += realized;
+                    qty1 += matched as i128;
+                    frags1 += 1;
+                } else {
+                    realized2 += realized;
+                    qty2 += matched as i128;
+                    frags2 += 1;
+                }
+            }
+            remaining -= matched;
+            if lot.qty == 0 {
+                head += 1;
+            }
+        }
+    }
+
+    if head < lots.len() {
+        carry.extend(lots.into_iter().skip(head));
+    }
+    pnl.buckets[0] = BucketPnl { realized_ticks: realized0, matched_qty: qty0, fragments: frags0 };
+    pnl.buckets[1] = BucketPnl { realized_ticks: realized1, matched_qty: qty1, fragments: frags1 };
+    pnl.buckets[2] = BucketPnl { realized_ticks: realized2, matched_qty: qty2, fragments: frags2 };
+    pnl
+}
+
+fn fold_core_fifo_nosink(
+    carry: &mut VecDeque<Lot>,
+    recs: &[PackedTrade],
+    count: Option<(i32, i32)>,
+    rules: &BucketRules,
+) -> PartitionPnl {
+    let mut pnl = PartitionPnl::default();
+    let mut lots = Vec::with_capacity(carry.len() + recs.len());
+    lots.extend(carry.drain(..));
+    let mut head = 0usize;
+
+    for r in recs {
+        if r.signed_qty > 0 {
+            lots.push(Lot {
+                qty: r.signed_qty as i64,
+                price_ticks: r.price_ticks as i64,
+                day: r.day,
+            });
+            continue;
+        }
+        if r.signed_qty >= 0 {
+            continue;
+        }
+
+        let mut remaining = -(r.signed_qty as i64);
+        let sell_ticks = r.price_ticks as i64;
+        let sell_day = r.day;
+        let counted = match count {
+            Some((lo, hi)) => sell_day >= lo && sell_day <= hi,
+            None => true,
+        };
+        while remaining > 0 && head < lots.len() {
+            let lot = &mut lots[head];
+            let matched = remaining.min(lot.qty);
+            let buy_day = lot.day;
+            let buy_ticks = lot.price_ticks;
+            lot.qty -= matched;
+            if counted {
+                let bucket = classify(rules, buy_day, sell_day);
+                let realized = matched as i128 * (sell_ticks - buy_ticks) as i128;
+                pnl.bucket_mut(bucket).add_frag(realized, matched);
+            }
+            remaining -= matched;
+            if lot.qty == 0 {
+                head += 1;
+            }
+        }
+    }
+
+    if head < lots.len() {
+        carry.extend(lots.into_iter().skip(head));
     }
     pnl
 }
