@@ -32,6 +32,9 @@ pub mod writer;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+#[cfg(feature = "lance")]
+pub mod lance_store;
+
 pub use config::GenConfig;
 pub use generate::generate;
 pub use manifest::Manifest;

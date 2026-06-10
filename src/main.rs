@@ -50,6 +50,23 @@ enum Cmd {
     Correct(CorrectArgs),
     /// Run the three-arm benchmark (M6): CPU packed vs status-quo (vs GPU).
     Bench(BenchArgs),
+    /// Store the packed compute table in a versioned Lance dataset and read it
+    /// back (Stage 1 Lance backend). Requires `--features lance`.
+    #[cfg(feature = "lance")]
+    Lance(LanceArgs),
+}
+
+#[cfg(feature = "lance")]
+#[derive(Parser)]
+struct LanceArgs {
+    #[arg(long, default_value = "data/compute.fifopack")]
+    packed: PathBuf,
+    #[arg(long, default_value = "data/compute.lance")]
+    uri: PathBuf,
+    /// Also write the round-tripped table back to a `.fifopack` (so query/bench
+    /// can run on the Lance-sourced data).
+    #[arg(long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -356,6 +373,38 @@ fn main() -> Result<()> {
                 &args.checkpoints,
                 &args.router_log,
             )?;
+        }
+        #[cfg(feature = "lance")]
+        Cmd::Lance(args) => {
+            let table = PackedTable::open(&args.packed)?;
+            let uri = args
+                .uri
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("--uri is not valid UTF-8"))?;
+            let t0 = std::time::Instant::now();
+            let version = fifo_gpu::lance_store::write(&table, uri)?;
+            println!(
+                "Wrote {} rows / {} partitions → Lance dataset {} (version {}) in {:.2}s",
+                table.n_rows(),
+                table.n_parts(),
+                uri,
+                version,
+                t0.elapsed().as_secs_f64()
+            );
+            let t1 = std::time::Instant::now();
+            let b = fifo_gpu::lance_store::open(uri)?;
+            let identical = b.records.as_slice() == table.records();
+            println!(
+                "Read back {} rows / {} partitions in {:.2}s — records identical: {}",
+                b.records.len(),
+                b.n_parts(),
+                t1.elapsed().as_secs_f64(),
+                identical
+            );
+            if let Some(out) = &args.out {
+                b.write(out)?;
+                println!("Wrote round-tripped compute table → {}", out.display());
+            }
         }
         Cmd::Stats(args) => {
             let manifest = Manifest::read(&args.out)?;

@@ -33,12 +33,20 @@ cudarc = { version = "0.12", optional = true, default-features = false, features
     "driver",
     "cuda-version-from-build-system",
 ] }
+# Lance backend (versioned compute-table store) — heavy async dependency, only
+# built with `--features lance`. lance pins its own arrow version; we re-export
+# arrow types through `lance::arrow` in lance_store.rs to stay compatible.
+lance = { version = "0.24", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
+futures = { version = "0.3", optional = true }
 
 [features]
 default = []
 # Enable on an NVIDIA box (needs the CUDA toolkit + driver). Compiles the GPU
 # FIFO arm. Will NOT build on a machine without CUDA — that is expected.
 gpu = ["dep:cudarc"]
+# Lance-backed versioned compute-table store (read→repack). Heavy build.
+lance = ["dep:lance", "dep:tokio", "dep:futures"]
 
 [profile.release]
 opt-level = 3
