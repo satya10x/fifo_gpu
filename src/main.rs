@@ -8,7 +8,7 @@ use fifo_gpu::config::GenConfig;
 use fifo_gpu::fifo::{fold_table, PartitionPnl};
 use fifo_gpu::manifest::Manifest;
 use fifo_gpu::packed::PackedTable;
-use fifo_gpu::query::{run_cpu, ClientSel, Query, Span};
+use fifo_gpu::query::{run_cpu_nosink, ClientSel, Query, Span};
 use fifo_gpu::rollup::Rollup;
 use fifo_gpu::{calendar, correction};
 use std::path::PathBuf;
@@ -292,7 +292,7 @@ fn main() -> Result<()> {
                 other => anyhow::bail!("unknown --policy {other:?} (expected fifo|lifo|hifo)"),
             };
             let t0 = std::time::Instant::now();
-            let r = run_cpu(&table, ckpt, &q, &mut fifo_gpu::fifo::NoopSink, &rules, policy)?;
+            let r = run_cpu_nosink(&table, ckpt, &q, &rules, policy)?;
             let dt = t0.elapsed();
             println!(
                 "Query: {:?} symbol={:?} span={:?}",

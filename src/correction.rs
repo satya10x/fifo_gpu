@@ -12,7 +12,7 @@ use crate::config::GenConfig;
 use crate::fifo::{fold_partition, NoopSink, PartitionPnl};
 use crate::generate::regenerate_client;
 use crate::packed::PackedTrade;
-use crate::query::{self, ClientSel, Query, Span};
+use crate::query::{run_cpu_nosink, ClientSel, Query, Span};
 use crate::packed::PackedTable;
 use anyhow::Result;
 
@@ -84,9 +84,12 @@ pub fn verify_against_packed(
 ) -> Result<(PartitionPnl, PartitionPnl)> {
     let (regen, _, _) = recompute_client(cfg, client_id);
     let q = Query { clients: ClientSel::One(client_id), symbol: None, span: Span::Full };
-    let packed = query::run_cpu(
-        table, None, &q, &mut NoopSink,
-        &crate::fifo::BucketRules::default(), crate::fifo::MatchPolicy::Fifo,
+    let packed = run_cpu_nosink(
+        table,
+        None,
+        &q,
+        &crate::fifo::BucketRules::default(),
+        crate::fifo::MatchPolicy::Fifo,
     )?.pnl;
     Ok((regen, packed))
 }
