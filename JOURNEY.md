@@ -114,11 +114,12 @@ slow GPU path nobody would use. Knowing what *not* to build is a result too.
   (bytes = `[PackedTrade]` verbatim) and read into an **owned-buffer
   `PackedTable`** — no per-row rebuild, no temp file, GPU-DMA-able.
 - **Stage 2.1** — *keep* per-row `client_id`/`symbol_id` (self-describing,
-  queryable, audit-friendly; **zstd-compressed** via the `lance-encoding:compression`
-  field metadata, since they're constant within a partition) **and** add a compact
-  partition **sidecar**, so the fast read **projects only `rec`** + the sidecar (no
-  redundant scan). *(Measured: without compression those columns stored ~uncompressed
-  and doubled the dataset — see Part III; compression was added after seeing that.)*
+  queryable, audit-friendly; **zstd-compressed** via the V2.1 structural format +
+  `lance-encoding:compression` hint, since they're constant within a partition)
+  **and** add a compact partition **sidecar**, so the fast read **projects only
+  `rec`** + the sidecar (no redundant scan). *(Measured: those columns first stored
+  ~uncompressed and doubled the dataset; the default format ignored the compression
+  hint — switching to the V2.1 file format honored it, 3.8 → 2.5 GB. See Part III.)*
 - **Wired in** — `query`/`bench` take `--uri` to run straight off Lance; read cut
   to a single bulk copy.
 - **A.3** — both GPU kernels generalized to **K-way bucketing**; `fifo query
@@ -226,14 +227,18 @@ is now compute-bound, so the next lever is kernel throughput, not fewer bytes.
 | Packed compute table (`.fifopack`) | **1.9 GB** | transparent, **uncompressed** (GPU-direct, by design — Decision 5) |
 | Lance dataset, **one version, uncompressed cols** | **3.8 GB** | `rec` ~2 GB + per-row client/symbol ~1.8 GB *(uncompressed)* |
 | — same, **two retained versions** | 7.6 GB | versioning copies on overwrite until compaction |
-| — **one version, client/symbol zstd** | **~2 GB (expected)** | redundant columns crushed; ≈ fifopack, self-description kept |
+| — **one version, V2.1 + client/symbol zstd** | **2.5 GB** | redundant columns compressed (3.8 → 2.5 GB, −1.3 GB); `rec` ~2 GB untouched + ~0.5 GB residual compressed cols |
 | Partition sidecar (`.parts.json`) | 1.3 MB | compact 74 k `(client,symbol,offset)` triples |
 
 **Findings:** (1) the packed format is slightly *larger* than Parquet on disk
 because it's deliberately uncompressed for GPU-direct reads — a tiny price for the
 ~10× faster read. (2) Lance defaulted to **uncompressed** per-row columns (~24 B/row),
-making a version ~2× the packed store; **zstd on those columns** (constant within a
-partition) recovers ~1.8 GB → Lance ≈ fifopack while keeping self-description.
+making a version ~2× the packed store; writing in the **V2.1 structural format with
+a zstd hint** on those columns (constant within a partition) recovers **1.3 GB
+(3.8 → 2.5 GB)** while keeping self-description — the remaining ~0.6 GB over the
+packed file is the high-entropy `rec` floor + residual compressed columns. *(The
+default/Stable Lance format silently ignores the compression hint — V2.1 was
+required.)*
 (3) overwrites **retain old versions** (time-travel) — compact / `rm`+rewrite to
 reclaim.
 

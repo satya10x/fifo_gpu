@@ -1,10 +1,13 @@
 //! Lance backend (Stage 2.1) — versioned, transparent, self-describing store.
 //!
 //! The dataset keeps **per-row `client_id`/`symbol_id`** columns (so it stays
-//! self-describing, queryable-by-client in Lance, and audit-friendly — Lance
-//! RLE-compresses these hugely-repetitive columns, so they're nearly free on
-//! disk) plus the records in a transparent **`FixedSizeBinary(12)`** column whose
-//! bytes are exactly our `[PackedTrade]` layout.
+//! self-describing, queryable-by-client in Lance, and audit-friendly). These are
+//! constant-within-partition, so we write the dataset in the **V2.1 structural
+//! format with a `zstd` hint** to compress them (the default/Stable format
+//! ignores the hint — measured 3.8 GB/version; V2.1+zstd brought 168M down to
+//! 2.5 GB, vs 1.9 GB for the column-free packed file). The records sit in a
+//! transparent **`FixedSizeBinary(12)`** column whose bytes are exactly our
+//! `[PackedTrade]` layout and stay uncompressed (high-entropy + GPU-DMA-able).
 //!
 //! For the **fast compute-load path** we don't pay to materialize the redundant
 //! per-row columns: a compact partition **sidecar** (`<uri>.parts.json`, ~the
