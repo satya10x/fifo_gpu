@@ -156,6 +156,61 @@ The two methods are **bit-identical** (validated: matched-qty exact, realized to
 > supports any matching policy). The GPU path uses the scan/searchsorted form.
 > They agree exactly; the router (§3) picks between them.
 
+### Visually: the share-axis
+
+Lay every *share* (not trade) of the example on one cumulative axis. FIFO becomes
+a geometry problem — overlap the sell interval with the buy lots:
+
+```
+ trades, in order:   [ +100 @₹200 ]   [ +100 @₹210 ]   [ −150 @₹220 ]
+                      \____ buy lots, accumulated ____/   \__ sell __/
+
+ share #   0          50         100         150         200
+           ├──────────┴──────────┼───────────┴───────────┤
+ BUY lots  │■■■■■ lot#1 @₹200 ■■■│■■■■■ lot#2 @₹210 ■■■■■│
+ SELL      │◀──────── 150 shares sold @₹220 ─────────▶│
+
+ searchsorted(cumBuy = [100, 200],  sell covers [0, 150) ) splits the sell:
+   shares [  0, 100) ↔ lot#1 : 100 × (220−200) = ₹2000   held 4d → short
+   shares [100, 150) ↔ lot#2 :  50 × (220−210) = ₹ 500   held 3d → short
+                                            Σ realized = ₹2500
+```
+
+The serial queue walks lots one share at a time; here a **binary search** lands
+each sell on its lots directly, and every sell is independent.
+
+### How it parallelizes — two levels
+
+```
+LEVEL 1 — ACROSS PARTITIONS (74k (client,symbol) groups, all independent)
+┌──────────────────────────────────────────────────────────────────────┐
+│  big partition  ─▶ one GPU BLOCK   (cooperative within-partition scan) │
+│  big partition  ─▶ one GPU BLOCK                                       │
+│  small parts ··· ─▶ one THREAD each (one-thread-per-partition kernel)  │
+│            … thousands run concurrently; no partition waits on another │
+└──────────────────────────────────────────────────────────────────────┘
+
+LEVEL 2 — WITHIN ONE BIG PARTITION (e.g. a 2.23M-row whale = one block)
+  records[]
+     │
+     ▼  ① SCAN          threads cooperate on a chunked block-wide prefix sum
+        prefix sums  ─▶ cumBuy[] , cumSell[]            (parallel, O(n))
+     │
+     ▼  ② SEARCHSORTED  one thread per sell: binary-search its [lo,hi) share
+        match lots      interval into cumBuy[] → which lots, how many shares
+     │                  (independent per sell — this is the parallel win)
+     ▼  ③ SEGMENTED-    each matched slice → qty×(sell−buy); classify the
+        REDUCE          holding span into bucket 0..K; atomic-add per bucket
+     │
+     ▼
+  out[partition] = [ bucket0_pnl , bucket1_pnl , … , bucketK_pnl ]
+```
+
+The serial dependency that made the Python queue O(n²) ("lot *k* needs *k−1*
+first") is gone: once the two prefix sums exist, **every sell is an independent
+binary search**, so the GPU runs them in parallel — across partitions *and*
+across the sells inside a big one.
+
 ---
 
 ## 2. Why Lance over Parquet
