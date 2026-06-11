@@ -23,6 +23,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance_file::version::LanceFileVersion;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,7 +118,14 @@ pub fn write(table: &PackedTable, uri: &str) -> Result<u64> {
         batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
         sch.clone(),
     );
-    let params = WriteParams { mode: WriteMode::Overwrite, ..Default::default() };
+    // V2.1 structural encoding honors the per-column zstd compression hint (the
+    // default/Stable format silently ignores it). `rec` is read back through
+    // Lance's decoder either way, so the projected read stays contiguous bytes.
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(LanceFileVersion::V2_1),
+        ..Default::default()
+    };
     let rt = runtime()?;
     let ds = rt
         .block_on(async { Dataset::write(reader, uri, Some(params)).await })
